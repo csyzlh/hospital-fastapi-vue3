@@ -1,0 +1,96 @@
+<template>
+  <div class="app-container">
+    <vab-page-header title="系统参数" description="配置系统运行参数和基础设置" />
+    <el-card>
+      <div class="page-toolbar">
+        <el-input
+          v-model="searchQuery"
+          placeholder="搜索参数"
+          clearable
+          class="page-search-input"
+        ></el-input>
+        <el-button type="primary" @click="fetchList">搜索</el-button>
+      </div>
+      <el-table :data="paginatedList" v-loading="loading" empty-text="暂无记录">
+        <el-table-column prop="config_key" label="参数键" />
+        <el-table-column prop="config_value" label="参数值" />
+        <el-table-column prop="description" label="说明" />
+        <el-table-column label="操作" width="120">
+          <template #default="{row}">
+            <el-button size="small" @click="handleEdit(row)">编辑</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        layout="total, sizes, prev, pager, next, jumper"
+        :total="total"
+        class="pagination-wrapper"
+      />
+
+    </el-card>
+
+    <el-dialog v-model="dialogVisible" title="编辑参数" width="500px">
+      <el-form :model="form" label-width="100px" class="dialog-form">
+        <el-form-item label="参数键">
+          <el-input v-model="form.config_key" disabled />
+        </el-form-item>
+        <el-form-item label="参数值">
+          <el-input v-model="form.config_value" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dialogVisible=false">取消</el-button>
+        <el-button type="primary" @click="submit">确定</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, computed } from "vue";
+import { ElMessage } from "element-plus";
+import { getConfigList, updateConfig } from "@/api/system";
+
+const list = ref([]);
+const searchQuery = ref("");
+const currentPage = ref(1);
+const pageSize = ref(10);
+const total = ref(0);
+const paginatedList = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return list.value.slice(start, start + pageSize.value);
+});
+
+const loading = ref(false);
+const dialogVisible = ref(false);
+const form = ref({});
+
+const fetchList = async () => {
+  loading.value = true;
+  const res = await getConfigList(searchQuery.value);
+  list.value = res.data || [];
+  total.value = list.value.length;
+  loading.value = false;
+};
+
+const handleEdit = (row) => {
+  form.value = { ...row };
+  dialogVisible.value = true;
+};
+
+const submit = async () => {
+  try {
+    await updateConfig(form.value);
+    ElMessage.success("更新成功");
+    dialogVisible.value = false;
+    fetchList();
+  } catch (e) {
+    ElMessage.error(e.msg || "更新失败");
+  }
+};
+
+onMounted(fetchList);
+</script>

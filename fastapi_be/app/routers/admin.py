@@ -1,0 +1,379 @@
+import datetime
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import ADMIN_ROLES, NOTICE_ROLES, ROLE_PATIENT, User, get_current_user, require_roles
+from app.models import Department, Doctor, HospitalCampus, Notice, Patient
+from app.pagination import paginate
+from app.privacy import can_view_full_patient_identity, mask_identity, mask_phone
+from app.schemas import (
+    CampusCreateRequest,
+    CampusDeleteRequest,
+    CampusUpdateRequest,
+    DepartmentCreateRequest,
+    DepartmentDeleteRequest,
+    DepartmentUpdateRequest,
+    DoctorDeleteRequest,
+    DoctorUpdateRequest,
+    NoticeCreateRequest,
+    NoticeDeleteRequest,
+    NoticeUpdateRequest,
+    PatientUpdateRequest,
+)
+
+router = APIRouter()
+
+
+def _campus_data(item: HospitalCampus):
+    return {
+        "id": item.campus_id,
+        "code": item.code,
+        "name": item.name,
+        "address": item.address or "",
+        "phone": item.phone or "",
+        "status": item.status,
+        "sort_order": item.sort_order,
+        "department_count": len(item.departments),
+    }
+
+
+@router.get("/campusManagement/getList")
+def get_campus_list(keyword: str | None = None, current_user: User = Depends(get_current_user), db: Session = Depends(get_db)):
+    query = db.query(HospitalCampus).order_by(HospitalCampus.sort_order, HospitalCampus.campus_id)
+    if keyword and keyword.strip():
+        like = f"%{keyword.strip()}%"
+        query = query.filter((HospitalCampus.code.ilike(like)) | (HospitalCampus.name.ilike(like)))
+    return {"code": 200, "msg": "success", "data": [_campus_data(item) for item in query.all()]}
+
+
+@router.post("/campusManagement/create")
+def create_campus(req: CampusCreateRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    if db.query(HospitalCampus).filter(HospitalCampus.code == req.code.strip()).first():
+        return {"code": 500, "msg": "院区编码已存在"}
+    now = datetime.datetime.now()
+    campus = HospitalCampus(
+        code=req.code.strip(), name=req.name.strip(), address=req.address.strip(), phone=req.phone.strip(),
+        status=req.status, sort_order=req.sort_order, create_time=now, update_time=now,
+    )
+    db.add(campus)
+    db.commit()
+    db.refresh(campus)
+    return {"code": 200, "msg": "success", "data": _campus_data(campus)}
+
+
+@router.post("/campusManagement/update")
+def update_campus(req: CampusUpdateRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    campus = db.query(HospitalCampus).filter(HospitalCampus.campus_id == req.campus_id).first()
+    if not campus:
+        return {"code": 500, "msg": "院区不存在"}
+    duplicate = db.query(HospitalCampus).filter(HospitalCampus.code == req.code.strip(), HospitalCampus.campus_id != req.campus_id).first()
+    if duplicate:
+        return {"code": 500, "msg": "院区编码已存在"}
+    campus.code = req.code.strip()
+    campus.name = req.name.strip()
+    campus.address = req.address.strip()
+    campus.phone = req.phone.strip()
+    campus.status = req.status
+    campus.sort_order = req.sort_order
+    campus.update_time = datetime.datetime.now()
+    db.commit()
+    return {"code": 200, "msg": "success", "data": _campus_data(campus)}
+
+
+@router.post("/campusManagement/delete")
+def delete_campus(req: CampusDeleteRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    campus = db.query(HospitalCampus).filter(HospitalCampus.campus_id == req.campus_id).first()
+    if not campus:
+        return {"code": 500, "msg": "院区不存在"}
+    if db.query(Department).filter(Department.campus_id == req.campus_id).first():
+        return {"code": 500, "msg": "院区下仍有科室，不能删除"}
+    db.delete(campus)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/doctorManagement/getList")
+def get_doctor_list(keyword: str | None = None, page: int | None = None, page_size: int | None = None, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)):
+    query = db.query(Doctor)
+    if keyword:
+        kw = f"%{keyword}%"
+        query = query.filter(Doctor.name.like(kw) | Doctor.title.like(kw) | Doctor.education.like(kw))
+    doctors, total = paginate(query, page, page_size)
+    data = []
+    for item in doctors:
+        data.append(
+            {
+                "id": item.doctor_id,
+                "name": item.name,
+                "sex": item.sex,
+                "education": item.education,
+                "phone": item.phone,
+                "permission": item.permission,
+                "title": item.title,
+            }
+        )
+    if keyword:
+        kw = keyword.lower()
+        data = [item for item in data if any(kw in str(val).lower() for val in item.values())]
+    result = {"code": 200, "msg": "success", "data": data}
+    if page and page_size:
+        result["total"] = total
+    return result
+
+
+@router.post("/doctorManagement/update")
+def update_doctor(req: DoctorUpdateRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    doctor = db.query(Doctor).filter(Doctor.doctor_id == req.doctor_id).first()
+    if not doctor:
+        return {"code": 500, "msg": "医生不存在"}
+    doctor.name = req.name
+    doctor.title = req.title
+    doctor.sex = 0 if req.sex == "女" else 1
+    doctor.phone = req.phone
+    doctor.department_id = req.department
+    doctor.permission = req.permission
+    doctor.education = req.education
+    db.add(doctor)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.post("/doctorManagement/delete")
+def delete_doctor(req: DoctorDeleteRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    from app.models import Appointment, DoctorSchedule, Registration
+
+    doctor = db.query(Doctor).filter(Doctor.doctor_id == req.doctor_id).first()
+    if not doctor:
+        return {"code": 500, "msg": "医生不存在"}
+    # 在职校验：仍有排班/未来预约/挂号记录的医生不可删（防统计与审计链断裂）
+    future = datetime.date.today()
+    schedule_cnt = db.query(DoctorSchedule).filter(DoctorSchedule.doctor_id == req.doctor_id).count()
+    if schedule_cnt:
+        return {"code": 500, "msg": f"该医生仍有 {schedule_cnt} 条排班记录，请先清理排班再删除"}
+    appt_cnt = db.query(Appointment).filter(Appointment.doctor_id == req.doctor_id, Appointment.time >= future).count()
+    if appt_cnt:
+        return {"code": 500, "msg": f"该医生仍有 {appt_cnt} 条未完成预约，请先处理预约再删除"}
+    reg_cnt = db.query(Registration).filter(Registration.doctor_id == req.doctor_id).count()
+    if reg_cnt:
+        return {"code": 500, "msg": f"该医生存在 {reg_cnt} 条历史挂号记录，不允许物理删除（会破坏审计链）"}
+    if doctor.user_id:
+        user = db.query(User).filter(User.user_id == doctor.user_id).first()
+        if user:
+            db.delete(user)
+    db.delete(doctor)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/patientManagement/getList")
+def get_patient_list(keyword: str | None = None, page: int | None = None, page_size: int | None = None, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)):
+    query = db.query(Patient)
+    if current_user.user_role == ROLE_PATIENT:
+        query = query.filter(Patient.identity == current_user.username)
+    if keyword:
+        like = f"%{keyword.strip()}%"
+        query = query.filter((Patient.name.ilike(like)) | Patient.identity.ilike(like) | Patient.phone.ilike(like))
+    patient_data, total = paginate(query, page, page_size)
+    reveal_sensitive = current_user.user_role == ROLE_PATIENT or can_view_full_patient_identity(current_user.user_role)
+    data = []
+    for item in patient_data:
+        sex = "女" if item.sex == 0 else "男"
+        data.append(
+            {
+                "id": item.patient_id,
+                "name": item.name,
+                "sex": sex,
+                "birthday": (item.birthday.strftime("%Y-%m-%d") if item.birthday else None),
+                "phone": item.phone if reveal_sensitive else mask_phone(item.phone),
+                "permission": item.permission,
+                "address": item.address,
+                "identity": item.identity if reveal_sensitive else mask_identity(item.identity),
+                "allergy_history": item.allergy_history or "",
+            }
+        )
+    result = {"code": 200, "msg": "success", "data": data}
+    if page and page_size:
+        result["total"] = total
+    return result
+
+
+@router.post("/patientManagement/update")
+def update_patient(req: PatientUpdateRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    patient = db.query(Patient).filter(Patient.patient_id == req.patient_id).first()
+    if not patient:
+        return {"code": 500, "msg": "病人不存在"}
+    patient.name = req.name
+    patient.sex = req.sex
+    patient.phone = req.phone
+    patient.address = req.address
+    if req.allergy_history is not None:
+        patient.allergy_history = req.allergy_history
+    db.add(patient)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/departmentManagement/getList")
+def get_department_list(keyword: str | None = None, campus_id: int | None = None, page: int | None = None, page_size: int | None = None, current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)):
+    query = db.query(Department)
+    if campus_id is not None:
+        query = query.filter(Department.campus_id == campus_id)
+    departments, total = paginate(query, page, page_size)
+    data = []
+    for item in departments:
+        director = db.query(Doctor).filter(Doctor.doctor_id == item.director).first()
+        director_name = director.name if director else ""
+        data.append(
+            {
+                "id": item.department_id,
+                "name": item.name,
+                "phone": item.phone,
+                "location": item.location,
+                "director": director_name,
+                "campus_id": item.campus_id,
+                "campus_name": item.campus.name if item.campus else "",
+            }
+        )
+    if keyword:
+        kw = keyword.lower()
+        data = [item for item in data if any(kw in str(val).lower() for val in item.values())]
+    result = {"code": 200, "msg": "success", "data": data}
+    if page and page_size:
+        result["total"] = total
+    return result
+
+
+@router.post("/departmentManagement/create")
+def department_register(req: DepartmentCreateRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    try:
+        dept = Department(
+            name=req.name,
+            phone=req.phone,
+            location=req.location,
+            director=req.director,
+            campus_id=req.campus_id,
+        )
+        db.add(dept)
+        db.commit()
+        return {"code": 200, "msg": "success"}
+    except Exception:
+        db.rollback()
+        return {"code": 500, "msg": "科室注册失败"}
+
+
+@router.post("/departmentManagement/update")
+def update_department(req: DepartmentUpdateRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    dept = db.query(Department).filter(Department.department_id == req.department_id).first()
+    if not dept:
+        return {"code": 500, "msg": "科室不存在"}
+    dept.name = req.name
+    dept.phone = req.phone
+    dept.location = req.location
+    dept.director = req.director
+    dept.campus_id = req.campus_id
+    db.add(dept)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.post("/departmentManagement/delete")
+def delete_department(req: DepartmentDeleteRequest, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    dept = db.query(Department).filter(Department.department_id == req.department_id).first()
+    if not dept:
+        return {"code": 500, "msg": "科室不存在"}
+    db.delete(dept)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/notice/getList")
+def get_notice_list(current_user: User = Depends(get_current_user), keyword: str | None = None, page: int | None = None, page_size: int | None = None, db: Session = Depends(get_db)):
+    query = db.query(Notice)
+    # 角色可见性：admin 全可见；其余按 towho（中文角色名列表）匹配
+    role_name_map = {"director": "科室主任", "doctor": "医生", "patient": "病人", "nurse": "护士", "pharmacist": "药剂师", "registration": "挂号", "cashier": "收费", "technician": "医技"}
+    role_cn = role_name_map.get(current_user.user_role)
+    if current_user.user_role not in ("admin", "super_admin"):
+        if role_cn:
+            query = query.filter(Notice.towho.like("%all%") | Notice.towho.like(f"%{role_cn}%"))
+        else:
+            query = query.filter(Notice.towho.like("%all%"))
+    if keyword:
+        kw = f"%{keyword}%"
+        query = query.filter(Notice.title.like(kw) | Notice.content.like(kw))
+    notices, total = paginate(query, page, page_size)
+    data = []
+    for item in notices:
+        data.append(
+            {
+                "uuid": str(item.notice_id),
+                "title": item.title,
+                "content": item.content,
+                "isemergency": item.isemergency,
+                "towho": item.towho,
+                "sendtime": (item.sendtime.strftime("%Y-%m-%d %H:%M:%S") if item.sendtime else None),
+                "expiredtime": (item.expiredtime.strftime("%Y-%m-%d %H:%M:%S") if item.expiredtime else None),
+                "readnum": item.readnum,
+                "writer": item.writer.username if item.writer else "",
+            }
+        )
+    result = {"code": 200, "msg": "success", "data": data}
+    if page and page_size:
+        result["total"] = total
+    return result
+
+
+@router.post("/notice/create")
+def notice_register(req: NoticeCreateRequest, current_user: User = Depends(require_roles(*NOTICE_ROLES)), db: Session = Depends(get_db)):
+    expired = None
+    if req.expiredtime:
+        try:
+            expired = datetime.datetime.strptime(req.expiredtime, "%Y-%m-%d")
+        except ValueError:
+            expired = datetime.datetime.strptime(req.expiredtime, "%Y-%m-%d %H:%M:%S")
+    notice = Notice(
+        title=req.title,
+        content=req.content,
+        isemergency=req.isemergency,
+        towho=str(req.towho),
+        sendtime=datetime.datetime.now(),
+        expiredtime=expired,
+        readnum=0,
+        writer_id=current_user.user_id,
+    )
+    db.add(notice)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.post("/notice/update")
+def update_notice(req: NoticeUpdateRequest, current_user: User = Depends(require_roles(*NOTICE_ROLES)), db: Session = Depends(get_db)):
+    notice = db.query(Notice).filter(Notice.notice_id == req.notice_id).first()
+    if not notice:
+        return {"code": 500, "msg": "通知不存在"}
+    notice.title = req.title
+    notice.content = req.content
+    notice.isemergency = req.isemergency
+    notice.towho = str(req.towho)
+    if req.expiredtime:
+        try:
+            notice.expiredtime = datetime.datetime.strptime(req.expiredtime, "%Y-%m-%d")
+        except ValueError:
+            notice.expiredtime = datetime.datetime.strptime(req.expiredtime, "%Y-%m-%d %H:%M:%S")
+    db.add(notice)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.post("/notice/delete")
+def delete_notice(req: NoticeDeleteRequest, current_user: User = Depends(require_roles(*NOTICE_ROLES)), db: Session = Depends(get_db)):
+    notice = db.query(Notice).filter(Notice.notice_id == req.notice_id).first()
+    if not notice:
+        return {"code": 500, "msg": "通知不存在"}
+    db.delete(notice)
+    db.commit()
+    return {"code": 200, "msg": "success"}

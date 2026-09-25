@@ -1,0 +1,80 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Node
+node_modules/
+dist/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Environment
+.env
+.env.local
+.env.*.local
+.venv/
+venv/
+env/
+
+# Database
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+package-lock.json
+
+# Backend runtime
+fastapi_be/backend.log
+fastapi_be/test.db
+fastapi_be/hoimsystem.db
+fastapi_be/migrate_passwords.py
+fastapi_be/test_*.py
+fastapi_be/.ruff_cache/
+fastapi_be/.pytest_cache/
+fastapi_be/.env
+
+# 用户上传的运行时文件（头像等）不入库
+fastapi_be/app/uploads/avatars/
+fastapi_be/app/uploads/reports/
+fastapi_be/app/uploads/*.xlsx
+fastapi_be/app/uploads/*.csv
+
+# 测试/压测产物
+fastapi_benchmark/benchmark/
+fastapi_benchmark/benchmark_results/
+fastapi_benchmark/*.csv
+fastapi_benchmark/tokens.json
+vue3-new-ui/test-results/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Frontend runtime
+vue3-new-ui/frontend.log
+
+# Misc
+EOF
+
+!.vscode/settings.json
+!.vscode/extensions.json

@@ -1,0 +1,173 @@
+<template>
+  <div class="app-container">
+    <vab-page-header title="病历管理" description="书写、查看和签名患者病历记录" />
+    <el-card>
+      <div class="page-toolbar">
+        <el-button type="primary" @click="handleAdd">新增病历</el-button>
+        <el-input
+          v-model="searchQuery"
+          placeholder="搜索患者姓名"
+          clearable
+          class="page-search-input"
+        ></el-input>
+        <el-button type="primary" @click="fetchList">搜索</el-button>
+      </div>
+      <el-table :data="paginatedList" v-loading="loading" border empty-text="暂无数据">
+        <el-table-column prop="consultation_time" label="就诊时间"  sortable />
+        <el-table-column prop="patient_name" label="患者"  sortable />
+        <el-table-column prop="symptom" label="症状" show-overflow-tooltip  sortable />
+        <el-table-column prop="result" label="诊断结果" show-overflow-tooltip  sortable />
+        <el-table-column label="状态" width="100">
+          <template #default="{row}">
+            <el-tag :type="row.status ? 'success' : 'warning'">{{ row.status_text || (row.status ? '已签名' : '草稿') }}</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="操作" width="230">
+          <template #default="{row}">
+            <el-button v-if="!row.status" size="small" @click="handleEdit(row)">编辑</el-button>
+            <el-button v-if="!row.status" size="small" type="success" @click="signRecord(row)">签名</el-button>
+            <el-button size="small" @click="viewDetail(row)">详情</el-button>
+          </template>
+        </el-table-column>
+      </el-table>
+      <el-pagination
+        v-model:current-page="currentPage"
+        v-model:page-size="pageSize"
+        :page-sizes="[10, 20, 50, 100]"
+        layout="total, sizes, prev, pager, next, jumper"
+        :total="total"
+        class="pagination-wrapper"
+      />
+
+    </el-card>
+
+    <el-dialog v-model="dialogVisible" :title="isEdit?'编辑病历':'新增病历'" width="600px">
+      <el-form :model="form" label-width="100px" class="dialog-form">
+        <el-form-item label="患者">
+          <el-select v-model="form.patient_id" placeholder="请选择患者" class="form-full-width" filterable>
+            <el-option v-for="p in patientOptions" :key="p.id" :label="p.name" :value="p.id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="症状">
+          <el-input v-model="form.symptom" type="textarea" :rows="3" />
+        </el-form-item>
+        <el-form-item label="诊断结果">
+          <el-input v-model="form.result" type="textarea" :rows="3" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dialogVisible=false">取消</el-button>
+        <el-button type="primary" @click="submit">确定</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="detailVisible" title="病历详情" width="600px">
+      <el-descriptions :column="1" border>
+        <el-descriptions-item label="就诊时间">{{ detail.consultation_time }}</el-descriptions-item>
+        <el-descriptions-item label="医生">{{ detail.doctor_name }}</el-descriptions-item>
+        <el-descriptions-item label="患者">{{ detail.patient_name }}</el-descriptions-item>
+        <el-descriptions-item label="症状">{{ detail.symptom }}</el-descriptions-item>
+        <el-descriptions-item label="诊断结果">{{ detail.result }}</el-descriptions-item>
+        <el-descriptions-item label="状态">
+          <el-tag :type="detail.status ? 'success' : 'warning'">{{ detail.status_text || (detail.status ? '已签名' : '草稿') }}</el-tag>
+        </el-descriptions-item>
+        <el-descriptions-item label="签名时间">{{ detail.sign_time || "未签名" }}</el-descriptions-item>
+      </el-descriptions>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted, computed } from "vue";
+import { ElMessage, ElMessageBox } from "element-plus";
+import { getMedicalRecordList, createMedicalRecord, updateMedicalRecord, signMedicalRecord, getMedicalRecordDetail } from "@/api/doctor";
+import { getPatientList } from "@/api/admin";
+
+const list = ref([]);
+const searchQuery = ref("");
+const currentPage = ref(1);
+const pageSize = ref(10);
+const total = ref(0);
+const paginatedList = computed(() => {
+  const start = (currentPage.value - 1) * pageSize.value;
+  return list.value.slice(start, start + pageSize.value);
+});
+
+const loading = ref(false);
+const dialogVisible = ref(false);
+const detailVisible = ref(false);
+const isEdit = ref(false);
+const form = ref({});
+const detail = ref({});
+const patientOptions = ref([]);
+
+const fetchList = async () => {
+  loading.value = true;
+  const res = await getMedicalRecordList(searchQuery.value);
+  list.value = res.data || [];
+  total.value = list.value.length;
+  loading.value = false;
+};
+
+const handleAdd = () => {
+  isEdit.value = false;
+  form.value = { patient_id: null, symptom: "", result: "" };
+  dialogVisible.value = true;
+};
+
+const handleEdit = (row) => {
+  if (row.status) {
+    ElMessage.warning("已签名病历不可修改");
+    return;
+  }
+  isEdit.value = true;
+  form.value = { ...row, medical_record_id: row.uuid };
+  dialogVisible.value = true;
+};
+
+const submit = async () => {
+  try {
+    if (!form.value.patient_id || !form.value.symptom?.trim() || !form.value.result?.trim()) {
+      ElMessage.warning("请完整填写患者、症状和诊断结果");
+      return;
+    }
+    if (isEdit.value) {
+      await updateMedicalRecord(form.value);
+    } else {
+      await createMedicalRecord(form.value);
+    }
+    ElMessage.success("操作成功");
+    dialogVisible.value = false;
+    fetchList();
+  } catch (e) {
+    ElMessage.error(e.msg || "操作失败");
+  }
+};
+
+const signRecord = async (row) => {
+  try {
+    await ElMessageBox.confirm("签名后病历不可普通修改，是否继续？", "签名确认", { type: "warning" });
+    await signMedicalRecord({ medical_record_id: row.uuid });
+    ElMessage.success("病历已签名");
+    await fetchList();
+  } catch (e) {
+    if (e !== "cancel" && e !== "close") ElMessage.error(e?.msg || "病历签名失败");
+  }
+};
+
+const viewDetail = async (row) => {
+  const res = await getMedicalRecordDetail({ medical_record_id: row.uuid });
+  detail.value = res.data || {};
+  detailVisible.value = true;
+};
+
+const loadPatients = async () => {
+  const res = await getPatientList(searchQuery.value);
+  patientOptions.value = res.data || [];
+};
+
+onMounted(() => {
+  fetchList();
+  loadPatients();
+});
+</script>

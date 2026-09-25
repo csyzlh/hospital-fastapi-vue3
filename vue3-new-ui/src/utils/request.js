@@ -1,0 +1,214 @@
+import axios from "axios";
+import {
+  baseURL,
+  contentType,
+  debounce,
+  invalidCode,
+  loginInterception,
+  noPermissionCode,
+  requestTimeout,
+  successCode,
+  tokenName,
+} from "@/config";
+import store from "@/store";
+import qs from "qs";
+import router from "@/router";
+import { isArray } from "@/utils/validate";
+import { ElLoading, ElMessage } from "element-plus";
+import { pickBy } from "lodash-es";
+
+let loadingInstance;
+
+/**
+
+ * @description 处理code异常
+ * @param {*} code
+ * @param {*} msg
+ */
+const handleCode = (code, msg) => {
+  switch (code) {
+    case invalidCode:
+      ElMessage.error(msg || `后端接口${code}异常`);
+      store.dispatch("user/resetAccessToken");
+      if (loginInterception) {
+        location.reload();
+      }
+      break;
+    case noPermissionCode:
+      store.dispatch("user/resetAccessToken");
+      router.push({ path: "/login" }).catch(() => {});
+      break;
+    default:
+      ElMessage.error(msg || `后端接口${code}异常`);
+      break;
+  }
+};
+
+// 请求重试配置
+const retryConfig = {
+  retry: 3, // 重试次数
+  retryDelay: 500, // 指数退避基准时间
+};
+
+const IDEMPOTENT_METHODS = new Set(["get", "head", "options"]);
+const RETRYABLE_STATUS = new Set([408, 425, 429, 500, 502, 503, 504]);
+
+const canRetry = (error) => {
+  const config = error?.config;
+  if (!config || !config.retry || error.code === "ERR_CANCELED") return false;
+
+  const method = (config.method || "get").toLowerCase();
+  // 写操作只有在调用方明确提供幂等键时才允许自动重试，防止重复挂号、收费或开药。
+  if (!IDEMPOTENT_METHODS.has(method) && !config.headers?.["Idempotency-Key"]) return false;
+
+  const status = error.response?.status;
+  return status === undefined || RETRYABLE_STATUS.has(status);
+};
+
+const retryDelay = (error, attempt) => {
+  const retryAfter = Number(error.response?.headers?.["retry-after"]);
+  if (Number.isFinite(retryAfter) && retryAfter >= 0) return retryAfter * 1000;
+  const base = error.config.retryDelay || retryConfig.retryDelay;
+  return base * 2 ** (attempt - 1) + Math.floor(Math.random() * 200);
+};
+
+// 创建axios实例
+const instance = axios.create({
+  baseURL,
+  timeout: requestTimeout,
+  headers: {
+    "Content-Type": contentType,
+  },
+});
+
+// 请求重试方法
+instance.defaults.retry = retryConfig.retry;
+instance.defaults.retryDelay = retryConfig.retryDelay;
+
+// 请求拦截器
+instance.interceptors.request.use(
+  (config) => {
+    if (store.state.user.accessToken) {
+      config.headers[tokenName] = store.state.user.accessToken;
+    }
+
+    // 不过滤 0 / false / 空字符串，只过滤 null / undefined
+    if (config.data) config.data = pickBy(config.data, (v) => v !== null && v !== undefined);
+    if (
+      config.data &&
+      config.headers["Content-Type"] ===
+        "application/x-www-form-urlencoded;charset=UTF-8"
+    )
+      config.data = qs.stringify(config.data);
+    if (debounce.some((item) => config.url.includes(item)))
+      loadingInstance = ElLoading.service();
+
+    return config;
+  },
+  (error) => {
+    return Promise.reject(error);
+  }
+);
+
+// 响应拦截器
+instance.interceptors.response.use(
+  (response) => {
+    if (loadingInstance) loadingInstance.close();
+
+    const { data, config } = response;
+
+    if (config.responseType === "blob" || config.responseType === "arraybuffer") {
+      return data;
+    }
+
+    // 判断data是否为undefined或null
+    if (data === undefined || data === null) {
+      ElMessage.error("后端接口返回数据为空");
+      return Promise.reject("后端接口返回数据为空");
+    }
+
+    // 安全地解构code和msg，避免undefined异常
+    const code = data.code !== undefined ? data.code : null;
+    const msg = data.msg !== undefined ? data.msg : "未知错误";
+
+    // 操作正常Code数组
+    const codeVerificationArray = isArray(successCode)
+      ? [...successCode]
+      : [...[successCode]];
+
+    // 是否操作正常
+    if (code !== null && codeVerificationArray.includes(code)) {
+      return data;
+    } else {
+      handleCode(code, msg);
+      return Promise.reject(
+        `vue-admin-better请求异常拦截:${JSON.stringify({
+          url: config.url,
+          code,
+          msg,
+        })}` || "Error"
+      );
+    }
+  },
+  (error) => {
+    if (loadingInstance) loadingInstance.close();
+
+    // 处理请求重试
+    const { config } = error;
+    if (canRetry(error)) {
+      // 设置当前重试次数
+      config.__retryCount = config.__retryCount || 0;
+
+      // 检查是否可以重试
+      if (config.__retryCount < config.retry) {
+        // 增加重试次数
+        config.__retryCount += 1;
+
+        // 创建新的Promise进行重试
+        const backoff = new Promise((resolve) => {
+          const delay = retryDelay(error, config.__retryCount);
+          setTimeout(() => {
+            console.log(
+              `重试请求: ${config.url}, 尝试次数: ${config.__retryCount}`
+            );
+            resolve();
+          }, delay);
+        });
+
+        // 重新发起请求
+        return backoff.then(() => instance(config));
+      }
+    }
+
+    // 处理undefined或无法解析的错误情况
+    if (!error) {
+      ElMessage.error("发生未知错误");
+      return Promise.reject("发生未知错误");
+    }
+
+    const { response, message } = error;
+    if (response && response.data) {
+      const { status, data } = response;
+      handleCode(status, data.msg || message || "未知错误");
+      return Promise.reject(error);
+    } else {
+      let errorMsg = "后端接口未知异常";
+
+      if (message) {
+        if (message === "Network Error") {
+          errorMsg = "后端接口连接异常";
+        } else if (message.includes("timeout")) {
+          errorMsg = "后端接口请求超时";
+        } else if (message.includes("Request failed with status code")) {
+          const code = message.substr(message.length - 3);
+          errorMsg = `后端接口${code}异常`;
+        }
+      }
+
+      ElMessage.error(errorMsg);
+      return Promise.reject(error);
+    }
+  }
+);
+
+export default instance;

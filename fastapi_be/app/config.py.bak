@@ -1,0 +1,5 @@
+"""Legacy backup placeholder. Do not put credentials in this file.
+
+The active configuration is ``app/config.py`` and reads values from the
+environment or a local, untracked ``.env`` file.
+"""

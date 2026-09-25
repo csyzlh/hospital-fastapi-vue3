@@ -1,0 +1,105 @@
+{
+  "name": "vue3-admin-better",
+  "version": "3.0.1",
+  "author": "zxwk1998",
+  "participants": [],
+  "homepage": "https://vuejs-core.cn",
+  "scripts": {
+    "serve:rspack": "node --no-deprecation rspack.js serve",
+    "build": "rimraf dist && node --no-deprecation rspack.js build",
+    "audit": "npm audit --audit-level=low",
+    "check:bundle": "node scripts/check-bundle-size.cjs",
+    "test:e2e": "playwright test",
+    "verify": "npm run audit && npm run build && npm run check:bundle",
+    "build:zip": "rimraf dist && node --no-deprecation rspack.js build && node build-zip.cjs",
+    "print-info": "node -e \"require('./layouts').donationConsole()\"",
+    "clear": "rimraf node_modules&&npm install  --registry=--registry=https://registry.npmmirror.com",
+    "update": "ncu -u --reject chalk,sass,sass-loader --registry=https://registry.npmmirror.com&&pnpm i --no-frozen-lockfile",
+    "module:update": "ncu -u --reject chalk,sass,sass-loader --registry=https://registry.npmmirror.com&&pnpm i --no-frozen-lockfile"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zxwk1998/vue-admin-better.git"
+  },
+  "gitHooks": {
+    "pre-commit": "lint-staged"
+  },
+  "lint-staged": {
+    "*.{js,jsx,vue}": [
+      "git add"
+    ]
+  },
+  "dependencies": {
+    "@element-plus/icons-vue": "^2.3.2",
+    "axios": "^1.19.0",
+    "caniuse-lite": "^1.0.30001791",
+    "clipboard": "^2.0.11",
+    "core-js": "^3.49.0",
+    "dayjs": "^1.11.20",
+    "echarts": "^6.1.0",
+    "element-plus": "^2.13.7",
+    "jsencrypt": "^3.5.4",
+    "layouts": "file:layouts",
+    "lodash-es": "^4.18.1",
+    "mitt": "^3.0.1",
+    "nprogress": "^0.2.0",
+    "qrcode.vue": "^3.9.0",
+    "qs": "^6.16.0",
+    "screenfull": "^6.0.2",
+    "vue": "^3.5.33",
+    "vue-router": "^5.0.6",
+    "vuedraggable": "^2.24.3",
+    "vuex": "^4.1.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.29.7",
+    "@babel/preset-env": "^7.29.2",
+    "@playwright/test": "^1.59.1",
+    "@rspack/cli": "^2.0.1",
+    "@rspack/core": "^2.0.1",
+    "@rspack/dev-server": "^2.0.1",
+    "@vue/compiler-sfc": "^3.5.33",
+    "archiver": "^7.0.1",
+    "babel-loader": "^10.1.1",
+    "body-parser": "^2.3.0",
+    "chalk": "4.1.2",
+    "chokidar": "^5.0.0",
+    "css-loader": "^7.1.4",
+    "html-rspack-plugin": "^6.1.8",
+    "path-browserify": "^1.0.1",
+    "rimraf": "^6.1.3",
+    "sass": "1.71.1",
+    "sass-loader": "^17.0.1",
+    "style-loader": "^4.0.0",
+    "unplugin-vue-components": "^32.1.0",
+    "vue-loader": "^17.4.2",
+    "webpack": "^5.106.2"
+  },
+  "keywords": [
+    "vue",
+    "admin",
+    "dashboard",
+    "element-plus",
+    "vue-admin",
+    "element-admin",
+    "boilerplate",
+    "admin-template",
+    "management-system"
+  ],
+  "overrides": {
+    "brace-expansion": "^5.0.9",
+    "browserslist": "^4.28.8",
+    "fast-uri": "^3.1.6",
+    "minimatch": "^10.2.5",
+    "nanoid": "^3.3.18",
+    "postcss": "^8.5.25",
+    "postcss-selector-parser": "^7.1.5",
+    "picomatch": "^4.0.4",
+    "serialize-javascript": "^7.0.5",
+    "immutable": "^5.1.9"
+  },
+  "engines": {
+    "node": "^20.19.0 || >=22.12.0",
+    "npm": ">=10.0.0"
+  }
+}

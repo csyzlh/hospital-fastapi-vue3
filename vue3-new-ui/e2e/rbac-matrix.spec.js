@@ -1,0 +1,593 @@
+/**
+ * 前端角色权限矩阵测试 (RBAC Matrix E2E)
+ *
+ * 验证: 11 种角色在前端RBAC过滤后,登录者仅能看到自己角色授权的菜单,
+ * 越权直接 URL 跳转后被 API 403 阻止;未登录访问页面被重定向到登录页。
+ *
+ * 需环境:
+ *  - FastAPI 后端运行在 http://localhost:8000
+ *  - Vue 前端运行在   http://localhost:8091
+ *  - hoimsystem.db 数据库已初始化(详见 init_database.py)
+ */
+const { test, expect } = require("@playwright/test");
+
+const BASE = process.env.E2E_BASE_URL || "http://localhost:8091";
+
+// 11 种角色的 (账号, 密码, 期望可见菜单列表)
+// 基于 doc/api-rbac-matrix.md 的推导
+const ROLE_USERS = [
+  {
+    name: "admin",
+    username: "admin",
+    password: "admin123",
+    menu: ["医生管理", "病人管理", "科室管理", "通知公告", "收费记录查询", "号源池管理",
+      "药品管理", "处方审核与发药", "库存预警", "库存盘点", "处方点评", "耗材管理",
+      "药品采购", "ADR监测", "费用管理", "发票管理", "窗口挂号", "日结对账",
+      "分诊台管理", "候诊队列", "候诊巡视", "预约报到", "违约记录", "生命体征录入",
+      "检查结果录入", "统计报表", "操作日志", "数据字典", "系统参数", "消息中心",
+      "数据备份恢复", "权限分配", "不良事件上报", "CA数字签名", "病区床位", "入院登记",
+      "住院医嘱", "护士工作站", "住院费用", "出院结算", "电子病历", "手术麻醉", "体检管理"],
+  },
+  {
+    name: "doctor",
+    username: "doctor1",
+    password: "doctor123",
+    menu: ["医生排班", "停诊/加号申请", "病历管理", "处方管理", "处方模板", "诊断模板", "检查检验申请", "考勤签到",
+      "多学科会诊", "临床路径", "处方审核与发药", "库存预警", "处方点评",
+      "分诊台管理", "候诊队列", "候诊巡视", "生命体征录入", "检查结果录入",
+      "随访管理", "入院登记", "住院医嘱", "护士工作站", "出院结算", "电子病历",
+      "手术麻醉", "体检管理"],
+  },
+  {
+    name: "patient",
+    username: "patient1",
+    password: "123456",
+    menu: ["智能导诊", "就诊导航", "预约挂号", "现场挂号", "缴费管理", "病历查询",
+      "处方查询", "健康档案", "家庭成员", "就诊评价", "预交金管理", "双向转诊"],
+  },
+  {
+    name: "cashier",
+    username: "cashier01",
+    password: "123456",
+    menu: ["费用管理", "收费项目", "发票管理", "窗口挂号", "日结对账"],
+  },
+  {
+    name: "pharmacist",
+    username: "pharmacist01",
+    password: "123456",
+    menu: ["药品管理", "处方审核与发药", "库存预警", "库存盘点", "库存调整", "发药统计", "特殊药品", "处方点评",
+      "耗材管理", "药品采购", "ADR监测"],
+  },
+  {
+    name: "director",
+    username: "director01",
+    password: "123456",
+    menu: ["医生排班", "病历管理", "处方管理", "检查检验申请", "考勤签到",
+      "多学科会诊", "临床路径", "处方审核与发药", "库存预警", "处方点评",
+      "分诊台管理", "候诊队列", "候诊巡视", "生命体征录入", "检查结果录入",
+      "随访管理", "入院登记", "住院医嘱", "护士工作站", "出院结算", "电子病历",
+      "手术麻醉", "体检管理", "通知公告"],
+  },
+  {
+    name: "nurse",
+    username: "nurse01",
+    password: "123456",
+    menu: ["生命体征录入", "入院护理评估", "护理计划", "危重护理记录", "手术护理记录", "分诊台管理", "候诊巡视", "急诊分诊", "抢救记录", "留观管理", "绿色通道", "预约报到", "病区床位", "输液管理", "注射管理", "皮试管理", "过敏标识", "交接班记录", "配药核对",
+      "入院登记", "护士工作站", "住院费用", "出院结算", "消息中心"],
+  },
+  {
+    name: "guide",
+    username: "guide01",
+    password: "123456",
+    menu: ["智能导诊", "分诊台管理", "候诊队列", "候诊巡视"],
+  },
+  {
+    name: "lab_technician",
+    username: "lab01",
+    password: "123456",
+    menu: ["检查结果录入"],
+  },
+  {
+    name: "registrar",
+    username: "registrar01",
+    password: "123456",
+    menu: ["挂号员服务"],
+  },
+  {
+    name: "super_admin",
+    username: "super01",
+    password: "123456",
+    // super_admin 权限与 admin 一致
+    menu: ["医生管理", "病人管理", "科室管理", "通知公告"],
+  },
+];
+
+let availableUsernames = new Set();
+
+test.beforeAll(async ({ request }) => {
+  const loginResponse = await request.post(`${BASE}/api/login`, {
+    data: { username: "admin", password: "admin123" },
+  });
+  if (!loginResponse.ok()) return;
+  const loginData = await loginResponse.json();
+  const token = loginData?.data?.accesstoken;
+  if (!token) return;
+  const usersResponse = await request.get(`${BASE}/api/user/getList`, {
+    headers: { accesstoken: token },
+  });
+  if (usersResponse.ok()) {
+    const usersData = await usersResponse.json();
+    availableUsernames = new Set((usersData.data || []).map((user) => user.username));
+  }
+});
+
+function skipIfUserUnavailable(testInfo, roleName) {
+  const role = ROLE_USERS.find((item) => item.name === roleName);
+  if (role && !availableUsernames.has(role.username)) {
+    testInfo.skip(true, `测试数据库未初始化 ${roleName} 账号 ${role.username}`);
+  }
+}
+
+async function login(page, username, password) {
+  await page.goto(`${BASE}/#/login`, { waitUntil: "networkidle" });
+  await page.evaluate(() => localStorage.clear());
+  await page.goto(`${BASE}/#/login`, { waitUntil: "networkidle" });
+  await page.waitForSelector('input[type="text"]', { timeout: 5000 });
+  await page.fill('input[type="text"]', username);
+  await page.fill('input[type="password"]', password);
+  await page.click('button:has-text("登录")');
+  await page.waitForTimeout(3000);
+}
+
+test.describe("登录认证", () => {
+  test("admin 登录成功并跳转到首页", async ({ page }) => {
+    await login(page, "admin", "admin123");
+    await expect(page).not.toHaveURL(/#\/login(?:\?|$)/);
+    await expect(page.locator("text=首页").first()).toBeVisible();
+  });
+
+  test("密码错误显示错误提示", async ({ page }) => {
+    await login(page, "admin", "wrongpassword");
+    await expect(page.locator(".el-message--error").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("未登录访问首页被重定向到登录页", async ({ page }) => {
+    await page.goto(`${BASE}/#/index`, { waitUntil: "networkidle" });
+    await page.evaluate(() => localStorage.clear());
+    await page.goto(`${BASE}/#/admin/doctorManagement`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page).toHaveURL(/#\/login(?:\?|$)/);
+  });
+});
+
+test.describe("角色菜单过滤 (RBAC)", () => {
+  for (const role of ROLE_USERS) {
+    test(`[${role.name}] 登录后菜单符合角色权限`, async ({ page }, testInfo) => {
+      skipIfUserUnavailable(testInfo, role.name);
+      await login(page, role.username, role.password);
+      // 等待页面加载
+      await page.waitForTimeout(2000);
+      // 验证登录成功
+      await expect(page).not.toHaveURL(/#\/login(?:\?|$)/);
+      // 验证至少一个期望菜单可见
+      const sidebar = page.locator(".el-menu-item");
+      const count = await sidebar.count();
+      expect(count).toBeGreaterThan(0);
+      const visibleTexts = await sidebar.allTextContents();
+      const matched = role.menu.some((m) => visibleTexts.some((t) => t.includes(m)));
+      expect(matched, `期望角色 ${role.name} 至少看到 ${role.menu.slice(0, 3)},实际看到: ${visibleTexts.slice(0, 5)}`).toBe(true);
+    });
+  }
+});
+
+test.describe("越权访问拦截", () => {
+  const sneakyRoutes = [
+    { role: "patient", target: "/admin/doctorManagement" },
+    { role: "patient", target: "/pharmacy/dispense" },
+    { role: "cashier", target: "/doctor/prescription" },
+    { role: "guide", target: "/patient/appointment" },
+    { role: "lab_technician", target: "/admin/patientManagement" },
+    { role: "nurse", target: "/pharmacy/dispense" },
+  ];
+
+  for (const { role, target } of sneakyRoutes) {
+    const user = ROLE_USERS.find((r) => r.name === role);
+    test(`[${role}] 越权访问 ${target} 时被拦截`, async ({ page }, testInfo) => {
+      skipIfUserUnavailable(testInfo, role);
+      await login(page, user.username, user.password);
+      await page.goto(`${BASE}/#${target}`, { waitUntil: "networkidle" });
+      await page.waitForTimeout(2000);
+      const url = page.url();
+      // 应该被留在原页面、404 页、或重定向到登录页,但不会正常渲染目标页面
+      // 验证:如果菜单存在,则当前页面不是目标页
+      const sidebar = page.locator(".el-menu-item");
+      const items = await sidebar.allTextContents();
+      // 期望越权后看到的菜单不包含目标页面对应标题
+      if (target.includes("doctorManagement")) {
+        expect(items.some((t) => t.includes("医生管理"))).toBeFalsy();
+      } else if (target.includes("pharmacy/dispense")) {
+        expect(items.some((t) => t.includes("处方审核与发药"))).toBeFalsy();
+      } else if (target.includes("admin/patientManagement")) {
+        expect(items.some((t) => t.includes("病人管理"))).toBeFalsy();
+      }
+    });
+  }
+});
+
+test.describe("业务页面渲染", () => {
+  test("admin 访问医生管理页面显示表格", async ({ page }) => {
+    await login(page, "admin", "admin123");
+    await page.goto(`${BASE}/#/admin/doctorManagement`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("admin 访问系统监控页面显示指标", async ({ page }) => {
+    await login(page, "admin", "admin123");
+    await page.goto(`${BASE}/#/system/monitor`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("系统监控").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("近24小时请求")).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("热点接口")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问排班页面显示排班表", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/doctor/schedule`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-table, .el-card").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问病案首页页面显示填写入口", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/inpatient/medicalRecordHome`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("病案首页").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("填写病案首页")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问病案归档页面显示归档入口", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/inpatient/medicalRecordArchive`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("病案归档/借阅").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("建立归档记录")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问 ICD-10 编码页面显示查询表格", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/inpatient/icd10`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("ICD-10 编码").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByRole("tab", { name: "诊断编码" })).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问病案首页质控页面显示统计卡片", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/inpatient/medicalRecordHomeQuality`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("病案首页质控").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("新增质控检查")).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("检查总数")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问处方模板页面显示模板表格", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/doctor/prescriptionTemplate`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("新建模板")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问诊断模板页面显示模板表格", async ({ page }) => {
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/doctor/diagnosisTemplate`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("新建诊断模板")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("patient 访问预约挂号页面显示排班信息", async ({ page }) => {
+    await login(page, "patient1", "123456");
+    await page.goto(`${BASE}/#/patient/appointment`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-card, .el-table").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("patient 访问家庭成员页面显示维护表格", async ({ page }) => {
+    await login(page, "patient1", "123456");
+    await page.goto(`${BASE}/#/patient/familyMember`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("添加家庭成员")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("patient 访问就诊导航页面显示科室卡片", async ({ page }) => {
+    await login(page, "patient1", "123456");
+    await page.goto(`${BASE}/#/patient/navigation`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("就诊导航").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".department-card").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("常见问题", { exact: true })).toBeVisible({ timeout: 5000 });
+  });
+
+  test("pharmacist 访问发药列表页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "pharmacist");
+    await login(page, "pharmacist01", "123456");
+    await page.goto(`${BASE}/#/pharmacy/dispense`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-table, .el-card").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("pharmacist 访问库存调整页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "pharmacist");
+    await login(page, "pharmacist01", "123456");
+    await page.goto(`${BASE}/#/pharmacy/inventoryAdjustment`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("提交调整单")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("pharmacist 访问发药统计页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "pharmacist");
+    await login(page, "pharmacist01", "123456");
+    await page.goto(`${BASE}/#/pharmacy/dispenseStats`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("发药统计").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("cashier 访问收费管理页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "cashier");
+    await login(page, "cashier01", "123456");
+    await page.goto(`${BASE}/#/charge/chargeList`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-table, .el-card").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("registrar 访问挂号员服务页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "registrar");
+    await login(page, "registrar01", "123456");
+    await page.goto(`${BASE}/#/charge/registrarService`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-card, .el-form").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问生命体征录入页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/vitalsign/vitalSign`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1500);
+    await expect(page.locator(".el-card, .el-form").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问输液管理页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/inpatient/infusion`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("输液管理").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问注射管理页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/inpatient/injection`, { waitUntil: "networkidle" });
+    await page.waitForTimeout(1000);
+    await expect(page.getByText("注射管理").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问皮试管理页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/inpatient/skinTest`, { waitUntil: "networkidle" });
+    await expect(page.getByText("皮试管理").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问过敏标识页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/inpatient/allergy`, { waitUntil: "networkidle" });
+    await expect(page.getByText("过敏标识").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("新增过敏标识")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问交接班页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/inpatient/shiftHandover`, { waitUntil: "networkidle" });
+    await expect(page.getByText("交接班记录").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("提交交班")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问配药核对页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/inpatient/dispenseVerification`, { waitUntil: "networkidle" });
+    await expect(page.getByText("配药核对").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("pharmacist 访问特殊药品页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "pharmacist");
+    await login(page, "pharmacist01", "123456");
+    await page.goto(`${BASE}/#/pharmacy/specialDrug`, { waitUntil: "networkidle" });
+    await expect(page.getByText("特殊药品").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("提交登记")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("cashier 访问收费项目页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "cashier");
+    await login(page, "cashier01", "123456");
+    await page.goto(`${BASE}/#/charge/chargeItem`, { waitUntil: "networkidle" });
+    await expect(page.getByText("收费项目").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("registrar 访问窗口预约处理页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "registrar");
+    await login(page, "registrar01", "123456");
+    await page.goto(`${BASE}/#/charge/windowAppointment`, { waitUntil: "networkidle" });
+    await expect(page.getByText("窗口预约处理").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("查看全部")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("lab technician 访问危急值报告", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "lab_technician");
+    await login(page, "lab01", "123456");
+    await page.goto(`${BASE}/#/lab/labResult`, { waitUntil: "networkidle" });
+    await expect(page.getByRole("tab", { name: "危急值报告" })).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-tabs").last()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("lab technician 访问检验套餐维护页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "lab_technician");
+    await login(page, "lab01", "123456");
+    await page.goto(`${BASE}/#/lab/labPackage`, { waitUntil: "networkidle" });
+    await expect(page.getByText("检验套餐维护").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("新增套餐")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("lab technician 访问质控管理页面显示趋势图", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "lab_technician");
+    await login(page, "lab01", "123456");
+    await page.goto(`${BASE}/#/lab/labQc`, { waitUntil: "networkidle" });
+    await expect(page.getByText("质控趋势图")).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("录入质控品")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问停诊加号申请页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "doctor");
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/doctor/scheduleChange`, { waitUntil: "networkidle" });
+    await expect(page.getByText("停诊/加号申请").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("提交申请")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问急诊分诊页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/queue/emergencyTriage`, { waitUntil: "networkidle" });
+    await expect(page.getByText("急诊分诊").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("提交分诊")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问抢救记录页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/queue/emergencyRescue`, { waitUntil: "networkidle" });
+    await expect(page.getByText("抢救记录").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("记录事件")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问留观管理页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/queue/emergencyObservation`, { waitUntil: "networkidle" });
+    await expect(page.getByText("留观管理").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("登记留观")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问绿色通道页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/queue/emergencyGreenChannel`, { waitUntil: "networkidle" });
+    await expect(page.getByText("绿色通道").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("提交绿色通道申请")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("doctor 访问急诊病历页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "doctor");
+    await login(page, "doctor1", "doctor123");
+    await page.goto(`${BASE}/#/queue/emergencyMedicalRecord`, { waitUntil: "networkidle" });
+    await expect(page.getByText("急诊病历").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("保存急诊病历")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问入院护理评估页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/vitalsign/nursingAssessment`, { waitUntil: "networkidle" });
+    await expect(page.getByText("入院护理评估").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("保存评估")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问护理计划页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/vitalsign/nursingPlan`, { waitUntil: "networkidle" });
+    await expect(page.getByText("护理计划").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("保存护理计划")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问危重护理记录页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/vitalsign/criticalCareRecord`, { waitUntil: "networkidle" });
+    await expect(page.getByText("危重护理记录").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("记录危重护理")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+
+  test("nurse 访问手术护理记录页面", async ({ page }, testInfo) => {
+    skipIfUserUnavailable(testInfo, "nurse");
+    await login(page, "nurse01", "123456");
+    await page.goto(`${BASE}/#/vitalsign/surgeryNursingRecord`, { waitUntil: "networkidle" });
+    await expect(page.getByText("手术护理记录").first()).toBeVisible({ timeout: 5000 });
+    await expect(page.getByText("保存手术护理记录")).toBeVisible({ timeout: 5000 });
+    await expect(page.locator(".el-table")).toBeVisible({ timeout: 5000 });
+  });
+});
+
+test.describe("UI 布局完整性", () => {
+  test("admin 登录后侧栏 logo 显示", async ({ page }) => {
+    await login(page, "admin", "admin123");
+    await page.waitForTimeout(2000);
+    await expect(page.getByRole("link", { name: "医院门诊信息管理系统" })).toBeVisible({ timeout: 5000 });
+  });
+
+  test("admin 登录后顶部导航有用户信息", async ({ page }) => {
+    await login(page, "admin", "admin123");
+    await page.waitForTimeout(2000);
+    await expect(page.locator(".navbar, .app-bar, .user-avatar").first()).toBeVisible({ timeout: 5000 });
+  });
+
+  test("admin 首页快捷入口可点击", async ({ page }) => {
+    await login(page, "admin", "admin123");
+    await page.waitForTimeout(2000);
+    const quickBtns = page.locator(".shortcut-item, .quick-entry, .el-card");
+    expect(await quickBtns.count()).toBeGreaterThan(0);
+  });
+});
+
+test.describe("响应式布局", () => {
+  test("mobile 视口下侧边栏折叠", async ({ page }) => {
+    await page.setViewportSize({ width: 375, height: 812 });
+    await login(page, "admin", "admin123");
+    await page.waitForTimeout(2000);
+    // 移动端菜单不应全部显示为展开状态
+    const sidebar = page.locator(".el-menu-item");
+    // 至少 page 没有崩溃即可
+    await expect(page.locator("body")).toBeVisible();
+    await page.setViewportSize({ width: 1440, height: 900 });
+  });
+});

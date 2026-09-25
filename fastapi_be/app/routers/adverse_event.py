@@ -1,0 +1,68 @@
+import datetime
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import ADMIN_ROLES, CLINICAL_ROLES, NURSING_ROLES, User, require_roles
+from app.models import AdverseEvent
+
+router = APIRouter()
+
+
+@router.post("/adverseEvent/create")
+def create_event(req: dict, current_user: User = Depends(require_roles(*{*CLINICAL_ROLES, *NURSING_ROLES, *ADMIN_ROLES})), db: Session = Depends(get_db)):
+    ev = AdverseEvent(
+        event_type=req.get("event_type", ""),
+        patient_id=req.get("patient_id"),
+        description=req.get("description", ""),
+        severity=req.get("severity", 1),
+        reporter_id=current_user.user_id,
+        report_time=datetime.datetime.now(),
+        status=0,
+    )
+    db.add(ev)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/adverseEvent/getList")
+def get_event_list(current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    items = db.query(AdverseEvent).order_by(AdverseEvent.report_time.desc()).all()
+    data = []
+    for it in items:
+        data.append(
+            {
+                "event_id": it.event_id,
+                "event_type": it.event_type,
+                "patient_name": it.patient.name if it.patient else "",
+                "description": it.description,
+                "severity": it.severity,
+                "severity_text": {1: "轻度", 2: "中度", 3: "重度"}.get(it.severity, ""),
+                "status": it.status,
+                "status_text": {0: "待处理", 1: "处理中", 2: "已闭环"}.get(it.status, ""),
+                "report_time": (it.report_time.strftime("%Y-%m-%d %H:%M:%S") if it.report_time else None) if it.report_time else "",
+                "handle_result": it.handle_result,
+            }
+        )
+    return {"code": 200, "msg": "success", "data": data}
+
+
+@router.post("/adverseEvent/updateStatus")
+def update_event_status(req: dict, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    ev = db.query(AdverseEvent).filter(AdverseEvent.event_id == req.get("event_id")).first()
+    if not ev:
+        return {"code": 500, "msg": "记录不存在"}
+    status = req.get("status")
+    if status not in (0, 1, 2):
+        return {"code": 400, "msg": "状态值不合法（0待处理 1处理中 2已闭环）"}
+    allowed = {0: {1, 2}, 1: {2}, 2: set()}
+    if status not in allowed.get(ev.status, set()):
+        return {"code": 400, "msg": f"状态迁移不合法：{ev.status} → {status}"}
+    if status == 2 and not (req.get("handle_result") or "").strip():
+        return {"code": 400, "msg": "闭环必须填写处理结论"}
+    ev.status = status
+    if req.get("handle_result"):
+        ev.handle_result = req.get("handle_result")
+    db.commit()
+    return {"code": 200, "msg": "success"}

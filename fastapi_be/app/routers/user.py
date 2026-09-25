@@ -1,0 +1,463 @@
+import datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation
+
+import jwt
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
+from sqlalchemy import func
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import get_db
+from app.dependencies import (
+    ADMIN_ROLES,
+    ROLE_CASHIER,
+    ROLE_PATIENT,
+    ROLE_SUPER_ADMIN,
+    VALID_USER_ROLES,
+    get_current_user,
+    is_admin,
+    require_roles,
+)
+from app.models import Patient, PrepaidTransaction, User
+from app.pagination import paginate
+from app.schemas import LoginRequest, RegisterRequest, UserInfoRequest
+from app.security import decrypt_transport_password, hash_password, is_bcrypt_hash, public_key_base64, verify_password
+
+router = APIRouter()
+
+MONEY_QUANTUM = Decimal("0.01")
+
+
+def _parse_prepaid_amount(value):
+    try:
+        amount = Decimal(str(value)).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+    if not amount.is_finite() or amount <= 0:
+        return None
+    return amount
+_LOGIN_FAILURE_WINDOW_SECONDS = 300
+_LOGIN_FAILURE_LIMIT = 5
+_LOCKOUT_DURATION_SECONDS = 300
+
+
+def _login_key(request: Request, username: str) -> str:
+    client = request.client.host if request.client else "unknown"
+    return f"{client}:{username.strip().lower()}"[:120]
+
+
+def _too_many_login_failures(key: str, db: Session) -> bool:
+    """数据库持久化锁定：多 worker 共享，重启不清零。"""
+    from app.models import LoginLockout
+
+    row = db.query(LoginLockout).filter(LoginLockout.lock_key == key).first()
+    if not row or not row.locked_until:
+        return False
+    if datetime.datetime.now() >= row.locked_until:
+        db.delete(row)
+        db.commit()
+        return False
+    return True
+
+
+def _record_login_failure(key: str, db: Session):
+    from app.models import LoginLockout
+
+    now = datetime.datetime.now()
+    row = db.query(LoginLockout).filter(LoginLockout.lock_key == key).first()
+    if not row:
+        row = LoginLockout(lock_key=key, fail_count=0, update_time=now)
+        db.add(row)
+    row.fail_count += 1
+    row.update_time = now
+    if row.fail_count >= _LOGIN_FAILURE_LIMIT:
+        row.locked_until = now + datetime.timedelta(seconds=_LOCKOUT_DURATION_SECONDS)
+        row.fail_count = 0  # 锁定期满后重新计数
+    db.commit()
+
+
+def _clear_login_failures(key: str, db: Session):
+    from app.models import LoginLockout
+
+    db.query(LoginLockout).filter(LoginLockout.lock_key == key).delete()
+    db.commit()
+
+
+def create_access_token(username: str) -> str:
+    issued_at = datetime.datetime.now(datetime.UTC)
+    expire = issued_at + datetime.timedelta(hours=24)
+    payload = {"sub": username, "exp": expire, "iat": issued_at}
+    return jwt.encode(payload, settings.SECRET_KEY, algorithm="HS256")
+
+
+def decode_access_token(token: str) -> str:
+    try:
+        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=["HS256"])
+        return payload.get("sub")
+    except jwt.ExpiredSignatureError:
+        return None
+    except jwt.InvalidTokenError:
+        return None
+
+
+@router.post("/test")
+async def test(request: Request, db: Session = Depends(get_db)):
+    """健康探测端点：仅返回固定回显，不转发任意请求体（原样回显已被移除）。"""
+    return {"code": 200, "msg": "success", "data": "ok"}
+
+
+@router.get("/publicKey")
+def get_public_key():
+    return {
+        "code": 200,
+        "msg": "success",
+        "data": {
+            "publicKey": public_key_base64(),
+            "mockServer": "False",
+        },
+    }
+
+
+@router.post("/login")
+def login(req: LoginRequest, request: Request, db: Session = Depends(get_db)):
+    key = _login_key(request, req.username)
+    if _too_many_login_failures(key, db):
+        return JSONResponse(status_code=429, content={"code": 429, "msg": "登录失败次数过多，请5分钟后重试"})
+    password = decrypt_transport_password(req.password)
+    user = db.query(User).filter(User.username == req.username).order_by(User.user_id.desc()).first()
+    if not password or not user or not verify_password(password, user.password):
+        _record_login_failure(key, db)
+        return {"code": 500, "msg": "账户或密码不正确"}
+    _clear_login_failures(key, db)
+    if not is_bcrypt_hash(user.password):
+        user.password = hash_password(req.password)
+        db.commit()
+    token = create_access_token(user.username)
+    return {"code": 200, "msg": "success", "data": {"accesstoken": token}}
+
+
+def parse_date_str(val):
+    if isinstance(val, str):
+        import datetime
+
+        try:
+            return datetime.datetime.strptime(val, "%Y-%m-%d").date()
+        except ValueError:
+            return datetime.datetime.strptime(val, "%Y-%m-%d %H:%M:%S").date()
+    return val
+
+
+@router.post("/register")
+def register(req: RegisterRequest, db: Session = Depends(get_db)):
+    try:
+        password = decrypt_transport_password(req.password)
+        if not password or not 6 <= len(password) <= 20:
+            return {"code": 500, "msg": "密码长度必须为6至20位"}
+        if db.query(Patient).filter(Patient.identity == req.identity).first():
+            # 统一模糊提示：避免成为"该身份证号是否已注册"的枚举探测点
+            return {"code": 500, "msg": "注册失败，请核对信息或联系医院"}
+        if db.query(User).filter(User.username == req.identity).first():
+            return {"code": 500, "msg": "注册失败，请核对信息或联系医院"}
+        patient = Patient(
+            name=req.username,
+            identity=req.identity,
+            address=req.address,
+            sex=req.sex,
+            phone=req.phone,
+            birthday=parse_date_str(req.birthday) if req.birthday else None,
+            permission="allow",
+        )
+        db.add(patient)
+        db.flush()
+        user = User(username=req.identity, password=hash_password(password), user_role="patient")
+        db.add(user)
+        db.commit()
+        return {"code": 200, "msg": "success"}
+    except Exception:
+        db.rollback()
+        return {"code": 500, "msg": "用户注册失败"}
+
+
+@router.post("/userInfo")
+def get_user_info(req: UserInfoRequest, db: Session = Depends(get_db)):
+    username = decode_access_token(req.accesstoken)
+    if not username:
+        raise HTTPException(status_code=401, detail="token无效或已过期")
+    user = db.query(User).filter(User.username == username).order_by(User.user_id.desc()).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="用户不存在")
+    # 吊销检查与标准鉴权路径保持一致（token-in-body 是历史兼容入口）
+    if user.token_invalid_before:
+        try:
+            payload = jwt.decode(
+                req.accesstoken,
+                settings.SECRET_KEY,
+                algorithms=["HS256"],
+                options={"verify_exp": False, "require": ["iat", "sub"]},
+            )
+            issued_at = payload.get("iat")
+            issued_dt = (
+                datetime.datetime.fromtimestamp(issued_at, datetime.UTC).replace(tzinfo=None)
+                if issued_at is not None
+                else None
+            )
+            if issued_dt is not None and issued_dt < user.token_invalid_before:
+                raise HTTPException(status_code=401, detail="Token 已被吊销，请重新登录")
+        except jwt.InvalidTokenError:
+            raise HTTPException(status_code=401, detail="token无效或已过期")
+    if user.user_role == "super_admin":
+        permissions = ["super_admin", "admin"]
+    elif user.user_role == "admin":
+        permissions = ["admin"]
+    elif user.user_role == "director":
+        permissions = ["director", "doctor"]
+    elif user.user_role in VALID_USER_ROLES:
+        permissions = [user.user_role]
+    else:
+        permissions = []
+    avatar_url = "https://gimg2.baidu.com/image_search/src=http%3A%2F%2Fc-ssl.duitang.com%2Fuploads%2Fitem%2F202006%2F07%2F20200607000651_vopye.jpg&refer=http%3A%2F%2Fc-ssl.duitang.com&app=2002&size=f9999,10000&q=a80&n=0&g=0n&fmt=auto?sec=1672814873&t=b4388830c9cf3005e51d64f282b07abc"
+    return {
+        "code": 200,
+        "msg": "success",
+        "data": {"permissions": permissions, "username": user.username, "avatar": avatar_url},
+    }
+
+
+@router.post("/logout")
+def logout(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """登出：吊销该用户当前时间之前的所有 token（服务端可撤销）。"""
+    current_user.token_invalid_before = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/user/getList")
+def get_user_list(
+    role: str | None = None,
+    page: int | None = None,
+    page_size: int | None = None,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """获取用户列表（管理员权限）"""
+    if not is_admin(current_user):
+        return {"code": 403, "msg": "无权访问"}
+    query = db.query(User)
+    if role:
+        query = query.filter(User.user_role == role)
+    users, total = paginate(query.order_by(User.user_id), page, page_size)
+    data = []
+    for item in users:
+        data.append(
+            {
+                "user_id": item.user_id,
+                "username": item.username,
+                "user_role": item.user_role,
+            }
+        )
+    result = {"code": 200, "msg": "success", "data": data}
+    if page is not None or page_size is not None:
+        result["total"] = total
+    return result
+
+
+@router.post("/user/updateRole")
+def update_user_role(req: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """修改用户角色"""
+    if not is_admin(current_user):
+        return {"code": 403, "msg": "无权访问"}
+    user_id = req.get("user_id")
+    new_role = req.get("user_role")
+    if not user_id or not new_role:
+        return {"code": 500, "msg": "参数错误"}
+    if new_role not in VALID_USER_ROLES:
+        return {"code": 500, "msg": "无效的角色"}
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        return {"code": 500, "msg": "用户不存在"}
+    if user.user_id == current_user.user_id or user.username == current_user.username:
+        return {"code": 500, "msg": "不能修改当前登录用户角色"}
+    if current_user.user_role != ROLE_SUPER_ADMIN and (
+        new_role == ROLE_SUPER_ADMIN or user.user_role == ROLE_SUPER_ADMIN
+    ):
+        return {"code": 403, "msg": "只有超级管理员可以管理超级管理员角色"}
+    user.user_role = new_role
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.post("/user/resetPassword")
+def reset_user_password(req: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """重置用户密码"""
+    if not is_admin(current_user):
+        return {"code": 403, "msg": "无权访问"}
+    user_id = req.get("user_id")
+    new_password = decrypt_transport_password(req.get("new_password"))
+    if not user_id:
+        return {"code": 500, "msg": "参数错误"}
+    if not isinstance(new_password, str) or not 6 <= len(new_password) <= 128:
+        return {"code": 500, "msg": "密码长度必须为6至128位"}
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        return {"code": 500, "msg": "用户不存在"}
+    user.password = hash_password(new_password)
+    # 改密后吊销该用户全部旧 token
+    user.token_invalid_before = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.post("/user/delete")
+def delete_user(req: dict, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """删除用户"""
+    if not is_admin(current_user):
+        return {"code": 403, "msg": "无权访问"}
+    user_id = req.get("user_id")
+    if not user_id:
+        return {"code": 500, "msg": "参数错误"}
+    if user_id == current_user.user_id:
+        return {"code": 500, "msg": "不能删除当前登录用户"}
+    user = db.query(User).filter(User.user_id == user_id).first()
+    if not user:
+        return {"code": 500, "msg": "用户不存在"}
+    db.delete(user)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/prepaid/getBalance")
+def get_prepaid_balance(identity: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """查询预交金余额"""
+    if current_user.user_role == ROLE_PATIENT and current_user.username != identity:
+        raise HTTPException(status_code=403, detail="无权访问其他患者账户")
+    if current_user.user_role not in {ROLE_PATIENT, ROLE_CASHIER, *ADMIN_ROLES}:
+        raise HTTPException(status_code=403, detail="无权访问")
+    patient = db.query(Patient).filter(Patient.identity == identity).first()
+    if not patient:
+        return {"code": 500, "msg": "病人不存在"}
+    return {"code": 200, "msg": "success", "data": {"balance": patient.prepaid_balance or 0}}
+
+
+@router.post("/prepaid/recharge")
+def prepaid_recharge(req: dict, db: Session = Depends(get_db), current_user: User = Depends(require_roles(ROLE_CASHIER, *ADMIN_ROLES))):
+    """预交金充值"""
+    patient = db.query(Patient).filter(Patient.identity == req.get("identity")).first()
+    if not patient:
+        return {"code": 500, "msg": "病人不存在"}
+    amount = _parse_prepaid_amount(req.get("amount", 0))
+    if amount is None:
+        return {"code": 500, "msg": "充值金额必须大于0"}
+    db.query(Patient).filter(Patient.patient_id == patient.patient_id).update(
+        {Patient.prepaid_balance: func.coalesce(Patient.prepaid_balance, 0) + amount},
+        synchronize_session=False,
+    )
+    db.refresh(patient)
+    db.add(PrepaidTransaction(
+        patient_id=patient.patient_id,
+        operator_id=current_user.user_id,
+        transaction_type="recharge",
+        amount=amount,
+        balance_after=patient.prepaid_balance,
+        create_time=datetime.datetime.now(),
+    ))
+    db.commit()
+    return {"code": 200, "msg": "success", "data": {"balance": patient.prepaid_balance}}
+
+
+@router.post("/prepaid/deduct")
+def prepaid_deduct(req: dict, db: Session = Depends(get_db), current_user: User = Depends(require_roles(ROLE_CASHIER, *ADMIN_ROLES))):
+    """预交金扣款"""
+    patient = db.query(Patient).filter(Patient.identity == req.get("identity")).first()
+    if not patient:
+        return {"code": 500, "msg": "病人不存在"}
+    amount = _parse_prepaid_amount(req.get("amount", 0))
+    if amount is None:
+        return {"code": 500, "msg": "扣款金额必须大于0"}
+    updated = db.query(Patient).filter(
+        Patient.patient_id == patient.patient_id,
+        func.coalesce(Patient.prepaid_balance, 0) >= amount,
+    ).update(
+        {Patient.prepaid_balance: func.coalesce(Patient.prepaid_balance, 0) - amount},
+        synchronize_session=False,
+    )
+    if updated != 1:
+        return {"code": 500, "msg": "预交金余额不足"}
+    db.refresh(patient)
+    db.add(PrepaidTransaction(
+        patient_id=patient.patient_id,
+        operator_id=current_user.user_id,
+        transaction_type="deduct",
+        amount=amount,
+        balance_after=patient.prepaid_balance,
+        create_time=datetime.datetime.now(),
+    ))
+    db.commit()
+    return {"code": 200, "msg": "success", "data": {"balance": patient.prepaid_balance}}
+
+
+@router.post("/prepaid/refund")
+def prepaid_refund(req: dict, db: Session = Depends(get_db), current_user: User = Depends(require_roles(ROLE_CASHIER, *ADMIN_ROLES))):
+    """预交金退款，退款金额不得超过当前余额。"""
+    patient = db.query(Patient).filter(Patient.identity == req.get("identity")).first()
+    if not patient:
+        return {"code": 500, "msg": "病人不存在"}
+    amount = _parse_prepaid_amount(req.get("amount", 0))
+    if amount is None:
+        return {"code": 500, "msg": "退款金额必须大于0"}
+    updated = db.query(Patient).filter(
+        Patient.patient_id == patient.patient_id,
+        func.coalesce(Patient.prepaid_balance, 0) >= amount,
+    ).update(
+        {Patient.prepaid_balance: func.coalesce(Patient.prepaid_balance, 0) - amount},
+        synchronize_session=False,
+    )
+    if updated != 1:
+        return {"code": 500, "msg": "预交金余额不足，无法退款"}
+    db.refresh(patient)
+    db.add(PrepaidTransaction(
+        patient_id=patient.patient_id,
+        operator_id=current_user.user_id,
+        transaction_type="refund",
+        amount=amount,
+        balance_after=patient.prepaid_balance,
+        note=str(req.get("reason") or "").strip()[:200] or None,
+        create_time=datetime.datetime.now(),
+    ))
+    db.commit()
+    return {"code": 200, "msg": "success", "data": {"balance": patient.prepaid_balance}}
+
+
+@router.get("/prepaid/getTransactions")
+def get_prepaid_transactions(
+    identity: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """查询预交金流水，仅允许患者本人或收费/管理人员查看。"""
+    if current_user.user_role == ROLE_PATIENT and current_user.username != identity:
+        raise HTTPException(status_code=403, detail="无权访问其他患者账户")
+    if current_user.user_role not in {ROLE_PATIENT, ROLE_CASHIER, *ADMIN_ROLES}:
+        raise HTTPException(status_code=403, detail="无权访问")
+    patient = db.query(Patient).filter(Patient.identity == identity).first()
+    if not patient:
+        return {"code": 500, "msg": "病人不存在"}
+    transactions = db.query(PrepaidTransaction).filter(
+        PrepaidTransaction.patient_id == patient.patient_id,
+    ).order_by(PrepaidTransaction.transaction_id.desc()).all()
+    return {
+        "code": 200,
+        "msg": "success",
+        "data": [
+            {
+                "transaction_id": item.transaction_id,
+                "type": item.transaction_type,
+                "amount": item.amount,
+                "balance_after": item.balance_after,
+                "operator_id": item.operator_id,
+                "create_time": item.create_time,
+                "note": item.note or "",
+            }
+            for item in transactions
+        ],
+    }

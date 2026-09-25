@@ -1,0 +1,94 @@
+import { createApp } from "vue";
+import App from "./App.vue";
+import router from "./router";
+import store from "@/store"; // 导入Vuex store
+import plugins from "./plugins";
+// 导入布局组件注册函数
+import { registerLayoutComponents } from "@/layouts/export";
+// 导入事件总线
+import eventBus from "@/utils/eventBus";
+import { clinicalEventStream } from "@/utils/clinicalEvents";
+// 导入配置
+import { title } from "@/config";
+
+/**
+ * @description 医院门诊信息管理系统前端入口
+ */
+
+// 创建应用实例
+const app = createApp(App);
+
+// 使用Vuex
+app.use(store);
+
+app.use(router);
+
+// 初始化所有插件
+plugins(app);
+
+// 注册所有布局组件
+registerLayoutComponents(app);
+
+// 添加事件总线到全局属性
+app.config.globalProperties.$eventBus = eventBus;
+
+// 添加全局标题
+app.config.globalProperties.$baseTitle = title;
+
+// 使全局属性在window上也可用
+window.$eventBus = eventBus;
+window.$baseTitle = title;
+
+// 登录态变化时建立/关闭带请求头鉴权的 SSE，令牌不会进入 URL 或访问日志。
+store.watch(
+  (state) => state.user.accessToken,
+  (accessToken) => (accessToken ? clinicalEventStream.start(accessToken) : clinicalEventStream.stop()),
+  { immediate: true }
+);
+
+// 生产环境提供可安装的移动 Web 体验；API 和医疗动态数据不由 Service Worker 缓存。
+if (process.env.NODE_ENV === "production" && "serviceWorker" in navigator) {
+  window.addEventListener("load", () => {
+    const serviceWorkerUrl = new URL("sw.js", document.baseURI);
+    navigator.serviceWorker.register(serviceWorkerUrl).catch((error) => {
+      console.warn("移动端离线壳注册失败", error);
+    });
+  });
+}
+
+// 抑制 ResizeObserver loop 运行时警告（Element Plus 组件常见，不影响功能）
+const resizeObserverLoopErr = "ResizeObserver loop completed with undelivered notifications";
+const isResizeObserverErr = (msg) =>
+  typeof msg === "string" && msg.includes("ResizeObserver loop");
+
+// Vue 全局错误处理
+app.config.errorHandler = (err) => {
+  if (isResizeObserverErr(err?.message)) return;
+  console.error(err);
+};
+
+// window 错误事件拦截
+window.addEventListener("error", (e) => {
+  if (isResizeObserverErr(e.message)) {
+    e.stopImmediatePropagation();
+    e.preventDefault();
+  }
+});
+
+// unhandledrejection 拦截
+window.addEventListener("unhandledrejection", (e) => {
+  if (isResizeObserverErr(e.reason?.message)) {
+    e.stopImmediatePropagation();
+    e.preventDefault();
+  }
+});
+
+// console.error 过滤，阻止 rspack overlay 弹窗
+const originalConsoleError = console.error;
+console.error = function (...args) {
+  if (args[0] && isResizeObserverErr(args[0]?.message ?? args[0])) return;
+  originalConsoleError.apply(console, args);
+};
+
+// 挂载应用
+app.mount("#hoim");

@@ -1,0 +1,86 @@
+import request from "@/utils/request";
+
+export function getChargeList(keyword = "") {
+  return request({ url: "chargeManagement/getList", method: "get", params: { keyword } });
+}
+
+export function commitCharge(data) {
+  return request({ url: "chargeManagement/charge", method: "post", data });
+}
+
+export function refundCharge(data) {
+  return request({ url: "chargeManagement/refund", method: "post", data });
+}
+
+export function getInvoiceList(keyword = "") {
+  return request({ url: "invoice/getList", method: "get", params: { keyword } });
+}
+
+export function createInvoice(data) {
+  return request({ url: "invoice/create", method: "post", data });
+}
+
+export function printInvoice(data) {
+  return request({ url: "invoice/print", method: "post", data });
+}
+
+export function downloadInvoicePdf(invoiceId) {
+  return request({ url: `invoice/pdf/${invoiceId}`, method: "get", responseType: "blob" });
+}
+
+export function windowRegistration(data) {
+  return request({ url: "windowRegistration/create", method: "post", data });
+}
+
+export function getWindowRegistrationSchedules(keyword = "") {
+  return request({ url: "windowRegistration/schedules", method: "get", params: { keyword } });
+}
+
+export function getWindowRegistrationPatient(identity) {
+  return request({ url: "windowRegistration/patient", method: "get", params: { identity } });
+}
+
+export function getChargeItemList() { return request({ url: "chargeItem/list", method: "get" }); }
+export function createChargeItem(data) { return request({ url: "chargeItem/create", method: "post", data }); }
+export function updateChargeItem(data) { return request({ url: "chargeItem/update", method: "put", data }); }
+export function toggleChargeItem(data) { return request({ url: "chargeItem/toggle", method: "post", data }); }
+
+export function windowCancelRegistration(data) {
+  return request({ url: "windowRegistration/cancel", method: "post", data });
+}
+
+export function getWindowAppointments(identity = "") {
+  return request({ url: "windowRegistration/appointments", method: "get", params: { identity } });
+}
+
+export function confirmWindowAppointment(data) {
+  return request({ url: "windowRegistration/appointmentConfirm", method: "post", data });
+}
+
+export function cancelWindowAppointment(data) {
+  return request({ url: "windowRegistration/appointmentCancel", method: "post", data });
+}
+
+export function dailySettlement(data) {
+  return request({ url: "dailySettlement/report", method: "post", data });
+}
+
+export function createPayment(data) {
+  return request({ url: "payment/create", method: "post", data });
+}
+
+export function queryPayment(paymentNo) {
+  return request({ url: `payment/query/${paymentNo}`, method: "get" });
+}
+
+export function mockPaymentNotify(data) {
+  return request({ url: "payment/mockNotify", method: "post", data });
+}
+
+export function getPaymentList(keyword = "") {
+  return request({ url: "payment/getList", method: "get", params: { keyword } });
+}
+
+export function dailySettlementByPayDate(data) {
+  return request({ url: "dailySettlement/byPayDate", method: "post", data });
+}

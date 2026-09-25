@@ -1,0 +1,77 @@
+import datetime
+
+from fastapi import APIRouter, Depends
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import ADMIN_ROLES, CLINICAL_ROLES, NURSING_ROLES, User, require_roles
+from app.models import AdverseReaction
+
+router = APIRouter()
+
+
+@router.post("/adverseReaction/create")
+def create_adr(req: dict, current_user: User = Depends(require_roles(*{*CLINICAL_ROLES, *NURSING_ROLES, *ADMIN_ROLES})), db: Session = Depends(get_db)):
+    ar = AdverseReaction(
+        patient_id=req.get("patient_id"),
+        pharmaceutical_id=req.get("pharmaceutical_id"),
+        symptom=req.get("symptom", ""),
+        severity=req.get("severity", 1),
+        report_time=datetime.datetime.now(),
+        reporter_id=current_user.user_id,
+        status=0,
+        note=req.get("note", ""),
+    )
+    db.add(ar)
+    db.commit()
+    return {"code": 200, "msg": "success"}
+
+
+@router.get("/adverseReaction/getList")
+def get_adr_list(current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    items = db.query(AdverseReaction).order_by(AdverseReaction.report_time.desc()).all()
+    data = []
+    for it in items:
+        data.append(
+            {
+                "reaction_id": it.reaction_id,
+                "patient_name": it.patient.name if it.patient else "",
+                "pharmaceutical_name": it.pharmaceutical.name if it.pharmaceutical else "",
+                "symptom": it.symptom,
+                "severity": it.severity,
+                "severity_text": {1: "轻度", 2: "中度", 3: "重度"}.get(it.severity, ""),
+                "status": it.status,
+                "status_text": {0: "待审核", 1: "已确认", 2: "已处理"}.get(it.status, ""),
+                "report_time": (it.report_time.strftime("%Y-%m-%d %H:%M:%S") if it.report_time else None) if it.report_time else "",
+                "note": it.note,
+            }
+        )
+    return {"code": 200, "msg": "success", "data": data}
+
+
+@router.post("/adverseReaction/updateStatus")
+def update_adr_status(req: dict, current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    ar = db.query(AdverseReaction).filter(AdverseReaction.reaction_id == req.get("reaction_id")).first()
+    if not ar:
+        return {"code": 500, "msg": "记录不存在"}
+    status = req.get("status")
+    if status not in (0, 1, 2):
+        return {"code": 400, "msg": "状态值不合法（0待评估 1已确认 2已排除）"}
+    allowed = {0: {1, 2}, 1: set(), 2: set()}
+    if status not in allowed.get(ar.status, set()):
+        return {"code": 400, "msg": f"状态迁移不合法：{ar.status} → {status}"}
+    ar.status = status
+    # 确认 ADR 时回写患者过敏史（闭环：再次开同种药会被拦截）
+    if status == 1 and ar.patient_id and ar.pharmaceutical_id:
+        from app.models import Patient, Pharmaceutical
+
+        patient = db.query(Patient).filter(Patient.patient_id == ar.patient_id).first()
+        pha = db.query(Pharmaceutical).filter(Pharmaceutical.pharmaceutical_id == ar.pharmaceutical_id).first()
+        drug_name = (pha.name or "").strip() if pha else ""
+        if patient and drug_name:
+            existing = patient.allergy_history or ""
+            if drug_name not in existing:
+                patient.allergy_history = (existing + ("；" if existing else "") + drug_name)[:200]
+                db.add(patient)
+    db.commit()
+    return {"code": 200, "msg": "success"}

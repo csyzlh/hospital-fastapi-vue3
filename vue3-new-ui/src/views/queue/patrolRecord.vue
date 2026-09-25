@@ -1,0 +1,102 @@
+<template>
+  <div class="app-container">
+    <vab-page-header title="候诊巡视记录" description="记录候诊区巡视情况和特殊患者状态" />
+    <el-card>
+      <div class="page-toolbar">
+        <el-button type="primary" @click="dialogVisible = true">新增巡视记录</el-button>
+      </div>
+      <el-table :data="patrolList" v-loading="loading" border empty-text="暂无巡视记录">
+        <el-table-column prop="nurse_name" label="护士" width="100" />
+        <el-table-column prop="patient_name" label="病人" width="100">
+          <template #default="{row}">
+            <el-tag v-if="row.patient_name" type="info" effect="plain">{{ row.patient_name }}</el-tag>
+            <span v-else style="color:#999">-</span>
+          </template>
+        </el-table-column>
+        <el-table-column prop="content" label="巡视内容" min-width="200" />
+        <el-table-column prop="status" label="状态" width="120">
+          <template #default="{row}">
+            <el-tag v-if="row.status === 0" type="success">正常</el-tag>
+            <el-tag v-else-if="row.status === 1" type="warning">需关注</el-tag>
+            <el-tag v-else type="danger">急诊绿色通道</el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column prop="create_time" label="记录时间" sortable width="180" />
+      </el-table>
+    </el-card>
+
+    <el-dialog v-model="dialogVisible" title="新增巡视记录" width="500px">
+      <el-form :model="form" label-width="80px">
+        <el-form-item label="患者">
+          <el-select v-model="form.patient_id" placeholder="选择患者" filterable class="form-full-width">
+            <el-option v-for="p in patients" :key="p.patient_id" :label="p.name" :value="p.patient_id" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="巡视内容">
+          <el-input v-model="form.content" type="textarea" rows="3" placeholder="描述巡视情况..." />
+        </el-form-item>
+        <el-form-item label="状态">
+          <el-select v-model="form.status">
+            <el-option label="正常" :value="0" />
+            <el-option label="需关注" :value="1" />
+            <el-option label="急诊绿色通道" :value="2" />
+          </el-select>
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="dialogVisible = false">取消</el-button>
+        <el-button type="primary" @click="submit">提交</el-button>
+      </template>
+    </el-dialog>
+  </div>
+</template>
+
+<script setup>
+import { ref, onMounted } from "vue";
+import { getPatrolList, createPatrolRecord } from "@/api/queue";
+import { getPatientList } from "@/api/admin";
+import { ElMessage } from "element-plus";
+
+const patrolList = ref([]);
+const loading = ref(false);
+const dialogVisible = ref(false);
+const form = ref({ patient_id: "", content: "", status: 0 });
+const patients = ref([]);
+
+const loadData = async () => {
+  loading.value = true;
+  try {
+    const res = await getPatrolList();
+    patrolList.value = res.data || [];
+  } catch (e) {
+    ElMessage.error(e.msg || "查询失败");
+  }
+  loading.value = false;
+};
+
+const loadPatients = async () => {
+  try {
+    const res = await getPatientList();
+    patients.value = res.data || [];
+  } catch (e) {
+    ElMessage.error("获取患者失败");
+  }
+};
+
+const submit = async () => {
+  try {
+    await createPatrolRecord(form.value);
+    ElMessage.success("记录成功");
+    dialogVisible.value = false;
+    form.value = { patient_id: "", content: "", status: 0 };
+    loadData();
+  } catch (e) {
+    ElMessage.error(e.msg || "提交失败");
+  }
+};
+
+onMounted(() => {
+  loadData();
+  loadPatients();
+});
+</script>

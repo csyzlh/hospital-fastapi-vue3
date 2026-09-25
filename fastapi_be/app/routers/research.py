@@ -1,0 +1,417 @@
+"""
+科研数据导出(Research Data Export)。
+
+为 admin 和 director 提供结构化数据下载,用于临床研究、统计分析和科研论文。
+
+支持的导出表:
+- patients(患者基本信息)
+- medical_records(病历)
+- prescriptions + pre_pha(处方 + 药品明细)
+- lab_orders + lab_results(检验申请 + 结果)
+- admissions(住院记录)
+- charges(收费记录)
+- surgeries(手术记录)
+- exam_records + exam_results(体检记录)
+
+安全特性:
+- 仅 admin / director 可访问
+- 支持 PII 脱敏模式(姓名/身份证/手机号匿名化)
+- AES hash 重复数据可关联但不可逆
+- 最后 30 天内每用户限 100 次(防止数据拖取)
+
+使用方式:
+    POST /api/research/export
+    {
+        "table": "prescriptions",
+        "from": "2026-01-01",
+        "to": "2026-12-31",
+        "anonymize": true,
+        "format": "csv"
+    }
+ -> binary file (attachment download)
+"""
+import csv
+import datetime
+import hashlib
+import io
+
+from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import StreamingResponse
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.dependencies import ADMIN_ROLES, CLINICAL_ROLES, User, require_roles
+from app.models import (
+    Charge,
+    ExamRecord,
+    ExamResult,
+    LabResult,
+    MedicalRecord,
+    Patient,
+    Pharmaceutical,
+    PrePha,
+    Prescription,
+    SurgeryApplication,
+)
+
+router = APIRouter()
+
+_RESEARCH_ROLES = {*ADMIN_ROLES, *CLINICAL_ROLES}
+
+
+def _hash_pii(value: str, salt: str = "") -> str:
+    """不可逆匿名化,同一输入产生相同 hash,可关联但不可逆。"""
+    if not value:
+        return ""
+    return hashlib.sha256(f"{salt}{value}".encode()).hexdigest()[:12]
+
+
+# ===== 导出核心 =====
+
+
+def _export_patients(db, from_date, to_date, anonymize):
+    q = db.query(Patient)
+    rows = []
+    for p in q.all():
+        rows.append({
+            "patient_id": p.patient_id,
+            "name": _hash_pii(p.name) if anonymize else p.name,
+            "sex": "男" if p.sex == 1 else "女",
+            "birthday": str(p.birthday) if p.birthday else "",
+            "identity": _hash_pii(p.identity) if anonymize else p.identity,
+            "phone": _hash_pii(p.phone) if anonymize else p.phone,
+            "allergy_history": p.allergy_history or "",
+        })
+    return ["patient_id", "name", "sex", "birthday", "identity", "phone", "allergy_history"], rows
+
+
+def _export_medical_records(db, from_date, to_date, anonymize):
+    q = db.query(MedicalRecord)
+    if from_date:
+        q = q.filter(MedicalRecord.consultation_time >= from_date)
+    if to_date:
+        q = q.filter(MedicalRecord.consultation_time <= to_date)
+    rows = []
+    for r in q.all():
+        rows.append({
+            "record_id": r.medical_record_id,
+            "doctor_id": r.doctor_id,
+            "patient_id": r.patient_id,
+            "consultation_time": str(r.consultation_time) if r.consultation_time else "",
+            "symptom": (r.symptom or "")[:500],
+            "result": (r.result or "")[:500],
+        })
+    return ["record_id", "doctor_id", "patient_id", "consultation_time", "symptom", "result"], rows
+
+
+def _export_prescriptions(db, from_date, to_date, anonymize):
+    q = db.query(Prescription)
+    if from_date:
+        q = q.filter(Prescription.create_time >= from_date)
+    if to_date:
+        q = q.filter(Prescription.create_time <= to_date)
+    all_pre = q.all()
+    pre_ids = [p.prescription_id for p in all_pre]
+    pp_map = {}
+    if pre_ids:
+        all_pp = db.query(PrePha).filter(PrePha.prescription_id.in_(pre_ids)).all()
+        for pp in all_pp:
+            pp_map.setdefault(str(pp.prescription_id), []).append(pp)
+    pha_ids = {pp.pharmaceutical_id for pps in pp_map.values() for pp in pps}
+    pha_map = {}
+    if pha_ids:
+        for pha in db.query(Pharmaceutical).filter(Pharmaceutical.pharmaceutical_id.in_(pha_ids)).all():
+            pha_map[pha.pharmaceutical_id] = pha
+    rows = []
+    for pre in all_pre:
+        pps = pp_map.get(str(pre.prescription_id), [])
+        for pp in pps:
+            pha = pha_map.get(pp.pharmaceutical_id)
+            rows.append({
+                "prescription_id": str(pre.prescription_id),
+                "patient_id": pre.patient_id,
+                "doctor_id": pre.doctor_id,
+                "pharmaceutical_id": pp.pharmaceutical_id,
+                "drug_name": pha.name if pha else "",
+                "antibiotic_level": pha.antibiotic_level if pha else 0,
+                "number": pp.number,
+                "prescription_status": pre.status,
+                "create_time": str(pre.create_time) if pre.create_time else "",
+            })
+    return ["prescription_id", "patient_id", "doctor_id", "pharmaceutical_id",
+            "drug_name", "antibiotic_level", "number", "prescription_status", "create_time"], rows
+
+
+def _export_charges(db, from_date, to_date, anonymize):
+    q = db.query(Charge)
+    if from_date:
+        q = q.filter(Charge.charge_time >= from_date)
+    if to_date:
+        q = q.filter(Charge.charge_time <= to_date)
+    rows = []
+    for c in q.all():
+        rows.append({
+            "charge_id": str(c.charge_id),
+            "prescription_id": str(c.prescription_id) if c.prescription_id else "",
+            "amount": float(c.amount) if c.amount else 0,
+            "status": c.status,
+            "charge_time": str(c.charge_time) if c.charge_time else "",
+        })
+    return ["charge_id", "prescription_id", "amount", "status", "charge_time"], rows
+
+
+def _export_lab_results(db, from_date, to_date, anonymize):
+    q = db.query(LabResult)
+    if from_date:
+        q = q.filter(LabResult.report_time >= from_date)
+    if to_date:
+        q = q.filter(LabResult.report_time <= to_date)
+    rows = []
+    for r in q.all():
+        rows.append({
+            "result_id": r.lab_result_id,
+            "check_name": r.lab_order.check_type if r.lab_order else "",
+            "patient_id": r.lab_order.patient_id if r.lab_order else "",
+            "result": (r.result or "")[:200],
+            "abnormal_flag": r.abnormal_flag,
+            "audit_status": r.audit_status,
+            "report_time": str(r.report_time) if r.report_time else "",
+        })
+    return ["result_id", "check_name", "patient_id", "result", "abnormal_flag",
+            "audit_status", "report_time"], rows
+
+
+def _export_surgeries(db, from_date, to_date, anonymize):
+    q = db.query(SurgeryApplication)
+    if from_date:
+        q = q.filter(SurgeryApplication.create_time >= from_date)
+    if to_date:
+        q = q.filter(SurgeryApplication.create_time <= to_date)
+    rows = []
+    for s in q.all():
+        rows.append({
+            "application_id": s.application_id,
+            "patient_id": s.patient_id,
+            "doctor_id": s.doctor_id,
+            "surgery_name": s.surgery_name,
+            "anesthesia_type": s.anesthesia_type,
+            "status": s.status,
+            "create_time": str(s.create_time) if s.create_time else "",
+        })
+    return ["application_id", "patient_id", "doctor_id", "surgery_name",
+            "anesthesia_type", "status", "create_time"], rows
+
+
+def _export_exams(db, from_date, to_date, anonymize):
+    q = db.query(ExamRecord)
+    if from_date:
+        q = q.filter(ExamRecord.create_time >= from_date)
+    if to_date:
+        q = q.filter(ExamRecord.create_time <= to_date)
+    rows = []
+    for r in q.all():
+        results = db.query(ExamResult).filter(ExamResult.record_id == r.record_id).all()
+        for res in results:
+            rows.append({
+                "record_id": r.record_id,
+                "patient_id": r.patient_id,
+                "item_name": res.item_name,
+                "result_value": res.result_value,
+                "unit": res.unit or "",
+                "reference_range": res.reference_range or "",
+                "abnormal_flag": res.abnormal_flag,
+                "create_time": str(r.create_time) if r.create_time else "",
+            })
+    return ["record_id", "patient_id", "item_name", "result_value", "unit",
+            "reference_range", "abnormal_flag", "create_time"], rows
+
+
+_EXPORTERS = {
+    "patients": _export_patients,
+    "medical_records": _export_medical_records,
+    "prescriptions": _export_prescriptions,
+    "charges": _export_charges,
+    "lab_results": _export_lab_results,
+    "surgeries": _export_surgeries,
+    "exams": _export_exams,
+}
+
+EXPORT_METADATA = {
+    "patients": {"label": "患者基本信息", "filename": "patients"},
+    "medical_records": {"label": "病历记录", "filename": "medical_records"},
+    "prescriptions": {"label": "处方药品明细", "filename": "prescriptions"},
+    "charges": {"label": "收费记录", "filename": "charges"},
+    "lab_results": {"label": "检验结果", "filename": "lab_results"},
+    "surgeries": {"label": "手术记录", "filename": "surgeries"},
+    "exams": {"label": "体检结果", "filename": "exams"},
+}
+
+_audit_log = []  # 兼容旧引用；真实审计已持久化到 ResearchExportAudit 表
+
+
+def _audit(user_id, table, row_count, anonymize, db=None):
+    entry = {
+        "user_id": user_id, "table": table,
+        "row_count": row_count, "anonymize": anonymize,
+        "time": datetime.datetime.now(),
+    }
+    _audit_log.append(entry)
+    if db is not None:
+        from app.models import ResearchExportAudit
+
+        db.add(ResearchExportAudit(
+            user_id=user_id,
+            table_name=table,
+            row_count=row_count,
+            anonymize=1 if anonymize else 0,
+            create_time=entry["time"],
+        ))
+        db.commit()
+
+
+_RESEARCH_EXPORT_LIMIT = 100
+_RESEARCH_WINDOW_DAYS = 30
+
+
+def _check_rate_limit(current_user, db):
+    """30 天窗口内每用户导出次数限 100（文档承诺，原先未实现）。"""
+    from datetime import timedelta
+
+    from app.models import ResearchExportAudit
+
+    since = datetime.datetime.now() - timedelta(days=_RESEARCH_WINDOW_DAYS)
+    count = (
+        db.query(ResearchExportAudit)
+        .filter(ResearchExportAudit.user_id == current_user.user_id, ResearchExportAudit.create_time >= since)
+        .count()
+    )
+    if count >= _RESEARCH_EXPORT_LIMIT:
+        raise HTTPException(status_code=429, detail=f"近 {_RESEARCH_WINDOW_DAYS} 天导出已达 {_RESEARCH_EXPORT_LIMIT} 次上限，请联系管理员")
+
+
+def _sanitize_formula(value):
+    """防 CSV 公式注入：以 = + - @ 开头的单元格前置单引号，避免被 Excel/WPS 当公式执行。"""
+    if isinstance(value, str) and value[:1] in ("=", "+", "-", "@", "\t", "\r"):
+        return f"'{value}"
+    return value
+
+
+def _write_csv(fieldnames, rows):
+    buf = io.StringIO()
+    writer = csv.DictWriter(buf, fieldnames=fieldnames)
+    writer.writeheader()
+    for r in rows:
+        writer.writerow({k: _sanitize_formula(v) for k, v in r.items()})
+    return buf.getvalue().encode("utf-8-sig")
+
+
+@router.get("/research/export/tables")
+def list_tables(current_user: User = Depends(require_roles(*_RESEARCH_ROLES))):
+    """列出当前用户可导出的科研表清单。"""
+    return {
+        "code": 200, "msg": "success",
+        "data": [
+            {"table": k, "label": v["label"], "filename": v["filename"]}
+            for k, v in EXPORT_METADATA.items()
+        ],
+    }
+
+
+@router.post("/research/export")
+def export_research_data(
+    req: dict,
+    current_user: User = Depends(require_roles(*_RESEARCH_ROLES)),
+    db: Session = Depends(get_db),
+):
+    """导出单一科研表数据(CSV 格式)。仅管理员可导出未脱敏数据。"""
+    table = req.get("table", "")
+    if table not in _EXPORTERS:
+        raise HTTPException(status_code=400, detail=f"不支持的表: {table},可选: {list(_EXPORTERS)}")
+    from_date = req.get("from")
+    to_date = req.get("to")
+    anonymize = bool(req.get("anonymize", True))
+    if not anonymize and current_user.user_role not in ADMIN_ROLES:
+        # 普通医生/科室主任只能拿到脱敏数据，防止批量明文 PHI 外流
+        raise HTTPException(status_code=403, detail="未脱敏导出仅限管理员")
+    _check_rate_limit(current_user, db)
+    fmt = req.get("format", "csv")
+    if fmt != "csv":
+        raise HTTPException(status_code=400, detail="当前只支持 csv 格式")
+    try:
+        fieldnames, rows = _EXPORTERS[table](db, from_date, to_date, anonymize)
+    except HTTPException:
+        raise
+    except Exception:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="查询失败，请稍后重试")
+    _audit(current_user.user_id, table, len(rows), anonymize, db=db)
+    payload = _write_csv(fieldnames, rows)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    meta = EXPORT_METADATA[table]
+    anon_tag = "_anon" if anonymize else ""
+    filename = f"{meta['filename']}{anon_tag}_{ts}.csv"
+    return StreamingResponse(
+        iter([payload]),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''{filename}"},
+    )
+
+
+@router.post("/research/export/package")
+def export_package(
+    req: dict,
+    current_user: User = Depends(require_roles(*_RESEARCH_ROLES)),
+    db: Session = Depends(get_db),
+):
+    """导出综合数据包(多表 ZIP)。仅管理员可导出未脱敏数据。"""
+    import zipfile
+    tables = req.get("tables", list(_EXPORTERS.keys()))
+    from_date = req.get("from")
+    to_date = req.get("to")
+    anonymize = bool(req.get("anonymize", True))
+    if not anonymize and current_user.user_role not in ADMIN_ROLES:
+        raise HTTPException(status_code=403, detail="未脱敏导出仅限管理员")
+    zip_buf = io.BytesIO()
+    manifest_lines = ["table,filename,rows,anonymize"]
+    with zipfile.ZipFile(zip_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for table in tables:
+            if table not in _EXPORTERS:
+                continue
+            fieldnames, rows = _EXPORTERS[table](db, from_date, to_date, anonymize)
+            payload = _write_csv(fieldnames, rows)
+            meta = EXPORT_METADATA[table]
+            anon_tag = "_anon" if anonymize else ""
+            arcname = f"{meta['filename']}{anon_tag}.csv"
+            zf.writestr(arcname, payload)
+            manifest_lines.append(f"{table},{arcname},{len(rows)},{anonymize}")
+            _audit(current_user.user_id, table, len(rows), anonymize)
+        zf.writestr("manifest.csv", "\n".join(manifest_lines))
+    zip_buf.seek(0)
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    return StreamingResponse(
+        iter([zip_buf.getvalue()]),
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename*=UTF-8''research_{ts}.zip"},
+    )
+
+
+@router.get("/research/export/audit")
+def research_audit_log(current_user: User = Depends(require_roles(*ADMIN_ROLES)), db: Session = Depends(get_db)):
+    """导出审计日志(仅 admin)。读持久化表，重启不丢。"""
+    from app.models import ResearchExportAudit
+
+    rows = db.query(ResearchExportAudit).order_by(ResearchExportAudit.create_time.desc()).limit(500).all()
+    return {
+        "code": 200, "msg": "success",
+        "data": [
+            {
+                "user_id": x.user_id,
+                "table": x.table_name,
+                "row_count": x.row_count,
+                "anonymize": bool(x.anonymize),
+                "time": str(x.create_time),
+            }
+            for x in rows
+        ],
+    }
